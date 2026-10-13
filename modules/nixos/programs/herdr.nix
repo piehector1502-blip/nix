@@ -1,0 +1,13 @@
+{ delib, inputs, pkgs, ... }:
+let
+  system = pkgs.stdenv.hostPlatform.system;
+  herdr = inputs.herdr.packages.${system}.default;
+in
+delib.module {
+  name = "programs.herdr";
+  options = delib.singleEnableOption false;
+
+  nixos.ifEnabled = {
+    environment.systemPackages = [ herdr ];
+  };
+}

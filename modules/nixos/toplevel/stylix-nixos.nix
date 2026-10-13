@@ -1,0 +1,170 @@
+{ delib
+, pkgs
+, lib
+, inputs
+, moduleSystem
+, ...
+}:
+delib.module {
+  name = "stylix";
+
+  options = with delib; moduleOptions {
+    enable = boolOption true;
+    targets = attrsOption { };
+  };
+
+  nixos.always =
+    { ... }:
+    {
+      imports = [
+        inputs.stylix.nixosModules.stylix
+      ];
+    };
+
+  home.always =
+    { ... }:
+    {
+      imports = lib.optionals (moduleSystem == "home") [
+        inputs.stylix.homeModules.stylix
+      ];
+    };
+
+  nixos.ifEnabled =
+    { myconfig, ... }:
+    let
+      fallbackWp = lib.findFirst (w: w.targetMonitor == "*") (builtins.head myconfig.constants.wallpapers) myconfig.constants.wallpapers;
+    in
+    {
+      home-manager.sharedModules = [{ stylix.enableReleaseChecks = true; }];
+
+      stylix = {
+        enable = true;
+        enableReleaseChecks = true;
+        polarity = myconfig.constants.theme.polarity or "dark";
+        base16Scheme = "${pkgs.base16-schemes}/share/themes/${
+          myconfig.constants.theme.base16Theme or "catppuccin-mocha"
+        }.yaml";
+        image = pkgs.fetchurl {
+          url = fallbackWp.wallpaperURL;
+          sha256 = fallbackWp.wallpaperSHA256;
+        };
+
+        cursor = {
+          name = "DMZ-Black";
+          size = 24;
+          package = pkgs.vanilla-dmz;
+        };
+        fonts = {
+          emoji = {
+            name = "Noto Color Emoji";
+            package = pkgs.noto-fonts-color-emoji;
+          };
+          monospace = {
+            name = "JetBrainsMono Nerd Font";
+            package = pkgs.nerd-fonts.jetbrains-mono;
+          };
+          sansSerif = {
+            name = "Noto Sans";
+            package = pkgs.noto-fonts;
+          };
+          serif = {
+            name = "Noto Serif";
+            package = pkgs.noto-fonts;
+          };
+          sizes = {
+            terminal = 13;
+            applications = 11;
+          };
+        };
+      };
+    };
+
+  home.ifEnabled =
+    { cfg, myconfig, ... }:
+    let
+      isCatppuccin = myconfig.constants.theme.catppuccin or false;
+      polarity = myconfig.constants.theme.polarity or "dark";
+      catppuccinGtkTheme = {
+        package = pkgs.catppuccin-gtk.override {
+          accents = [ (myconfig.constants.theme.catppuccinAccent or "mauve") ];
+          size = "standard";
+          tweaks = [
+            "rimless"
+            "black"
+          ];
+          variant = myconfig.constants.theme.catppuccinFlavor or "mocha";
+        };
+        name = "catppuccin-${myconfig.constants.theme.catppuccinFlavor or "mocha"}-${
+          myconfig.constants.theme.catppuccinAccent or "mauve"
+        }-standard+rimless,black";
+      };
+      hasWallpapers = myconfig.constants ? wallpapers && myconfig.constants.wallpapers != [ ];
+      fallbackWp =
+        if hasWallpapers then
+          lib.findFirst (w: w.targetMonitor == "*") (builtins.head myconfig.constants.wallpapers) myconfig.constants.wallpapers
+        else
+          null;
+
+    in
+    {
+      stylix = lib.mkMerge [
+        {
+          enable = true;
+          base16Scheme = "${pkgs.base16-schemes}/share/themes/${
+            myconfig.constants.theme.base16Theme or "catppuccin-mocha"
+          }.yaml";
+        }
+
+        (lib.mkIf hasWallpapers {
+          image = pkgs.fetchurl {
+            url = fallbackWp.wallpaperURL;
+            sha256 = fallbackWp.wallpaperSHA256;
+          };
+        })
+
+        {
+          targets = {
+            neovim.enable = false;
+            bat.enable = !isCatppuccin;
+            lazygit.enable = !isCatppuccin;
+            starship.enable = !isCatppuccin;
+            wofi.enable = false;
+            waybar.enable = false;
+            kde.enable = !isCatppuccin;
+            qt.enable = false;
+            gnome.enable = false;
+            hyprland.enable = !isCatppuccin;
+            hyprlock.enable = !isCatppuccin;
+            gtk.enable = !isCatppuccin;
+            swaync.enable = !isCatppuccin;
+            tmux.enable = !isCatppuccin;
+            gtksourceview.enable = false; # Could cause slow-downs during rebuilds. See "https://github.com/nix-community/stylix/discussions/2232#discussion-9598872"
+          } // cfg.targets;
+        }
+      ];
+
+      dconf.settings = {
+        "org/gnome/desktop/interface".color-scheme =
+          if polarity == "dark" then "prefer-dark" else "prefer-light";
+      };
+
+      home.sessionVariables = lib.mkIf isCatppuccin {
+        GTK_THEME = "catppuccin-${myconfig.constants.theme.catppuccinFlavor or "mocha"}-${
+          myconfig.constants.theme.catppuccinAccent or "mauve"
+        }-standard+rimless,black";
+        XDG_DATA_DIRS = "${pkgs.gsettings-desktop-schemas}/share/gsettings-schemas/${pkgs.gsettings-desktop-schemas.name}:${pkgs.gtk3}/share/gsettings-schemas/${pkgs.gtk3.name}:$XDG_DATA_DIRS";
+      };
+
+      gtk = lib.mkMerge [
+        (lib.mkIf isCatppuccin {
+          enable = true;
+          theme = catppuccinGtkTheme;
+        })
+        {
+          gtk3.extraConfig.gtk-application-prefer-dark-theme = if polarity == "dark" then 1 else 0;
+          gtk4.extraConfig.gtk-application-prefer-dark-theme = if polarity == "dark" then 1 else 0;
+          gtk4.theme = lib.mkIf isCatppuccin catppuccinGtkTheme;
+        }
+      ];
+    };
+}

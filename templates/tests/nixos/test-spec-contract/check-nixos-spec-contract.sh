@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+# Specialization contract checker.
+# Verifies that each specialization's lib.mkForce overrides actually land —
+# checks myconfig option values and key config artifacts (autostart entries,
+# shell aliases, scripts in home.packages) within each specialization's config.
+#
+# Usage:
+#   bash check-nixos-spec-contract.sh
+
+set -euo pipefail
+DIR="$(cd "$(dirname "$0")" && pwd)"
+FLAKE_ROOT="${FLAKE_ROOT:-$(cd "$DIR/../../../.." && pwd)}"
+export FLAKE_ROOT
+
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+BOLD='\033[1m'; DIM='\033[2m'; NC='\033[0m'
+
+PASS=0
+FAIL=0
+declare -a FAILURES=()
+
+run_check() {
+  local attr="$1" label="$2"
+  printf "  %-62s " "$label"
+  local result stderr_file
+  stderr_file=$(mktemp)
+  if result=$(nix eval --raw --impure --file "$DIR/01-scenario-spec-contract.nix" "$attr" 2>"$stderr_file"); then
+    if [[ "$result" == "ok" ]]; then
+      printf "${GREEN}✓ ok${NC}\n"
+      ((PASS++)) || true
+    else
+      printf "${RED}✗ fail${NC}\n"
+      ((FAIL++)) || true
+      FAILURES+=("$label|CHECK FAILED|$result")
+    fi
+  else
+    printf "${RED}✗ eval error${NC}\n"
+    ((FAIL++)) || true
+    local excerpt
+    excerpt=$(cat "$stderr_file" | grep -E "error:|missing|not available|undefined variable" | head -3 | tr '\n' '~')
+    FAILURES+=("$label|EVAL ERROR|$excerpt")
+  fi
+  rm -f "$stderr_file"
+}
+
+echo ""
+echo -e "${BOLD}=== Specialization contract check ===${NC}"
+echo -e "${DIM}Verifies that specialization lib.mkForce overrides are effective.${NC}"
+echo ""
+
+echo -e "${BOLD}guest${NC}"
+run_check "check-guest-hyprland-disabled"  "hyprland.enable == false"
+run_check "check-guest-stylix-disabled"    "myconfig.stylix.enable == false"
+run_check "check-guest-bluetooth-disabled" "bluetooth.enable == false"
+run_check "check-guest-hyprlock-disabled"  "services.hyprlock.enable == false"
+run_check "check-guest-swaync-disabled"    "services.swaync.enable == false"
+run_check "check-guest-welcome-desktop"    "autostart .desktop Exec points to guest-welcome"
+
+echo ""
+echo -e "${BOLD}school${NC}"
+run_check "check-school-browser-constant"  "constants.browser == 'brave-school'"
+run_check "check-school-editor-constant"   "constants.editor == 'nvim'"
+run_check "check-school-setup-script"      "school-distrobox-setup in home.packages"
+run_check "check-school-check-script"      "school-distrobox-check in home.packages"
+run_check "check-school-clear-script"      "school-distrobox-clear in home.packages"
+
+echo ""
+echo -e "${DIM}──────────────────────────────────────────────────────────────────────${NC}"
+
+if [[ $FAIL -eq 0 ]]; then
+  echo -e "${GREEN}${BOLD}All $PASS checks passed.${NC}"
+  exit 0
+fi
+
+echo -e "${RED}${BOLD}FAILURES ($FAIL of $((PASS + FAIL))):${NC}"
+echo ""
+for entry in "${FAILURES[@]}"; do
+  IFS="|" read -r label kind err <<< "$entry"
+  echo -e "  ${RED}✗${NC} ${BOLD}$label${NC}"
+  echo -e "    ${YELLOW}→ $kind${NC}"
+  if [[ -n "$err" ]]; then
+    echo "$err" | tr '~' '\n' | while IFS= read -r line; do
+      [[ -n "$line" ]] && echo -e "      ${DIM}$line${NC}" || true
+    done
+  fi
+done
+echo ""
+exit 1

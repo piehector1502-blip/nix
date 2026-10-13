@@ -1,0 +1,216 @@
+name: "NixOS Tests"
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+on:
+  push:
+    branches: [develop, main]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 6 * * 1" # Every Monday at 06:00 UTC
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test-nixos:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    env:
+      NIXPKGS_ALLOW_UNFREE: 1
+      WEBHOOK_ID: ${{ secrets.DISCORD_WEBHOOK_ID }}
+      CURL_HTTP_VERSION: 1.1
+      FLAKE_ROOT: ${{ github.workspace }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install CA Certificates
+        # Best-effort, and bounded. ca-certificates is preinstalled on the
+        # runner image and Nix uses its own CA bundle, so a broken third-party
+        # apt repo must not fail the suite - and `timeout-minutes` covers the
+        # case `|| true` cannot: apt HANGING rather than failing. Run 1130 lost
+        # a job to a 27-minute apt stall that a manual Cancel could not reach.
+        continue-on-error: true
+        timeout-minutes: 5
+        run: sudo apt-get update || true; sudo apt-get install -y ca-certificates || true
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Open permissions on /mnt
+        run: sudo chmod 1777 /mnt
+
+      - name: Maximize Nix Space
+        # Best-effort disk optimisation - it must never fail the suite. build.yml
+        # already guarded this; tests-nixos.yml did not, and on 2026-08-19 it
+        # failed here and skipped all six tests, which the summary below then
+        # reported as six FAILURES.
+        continue-on-error: true
+        uses: wimpysworld/nothing-but-nix@main
+        with:
+          hatchet-protocol: "cleave"
+          witness-carnage: true
+          nix-permission-edict: false
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+        with:
+          flakehub: false
+          extra-conf: |
+            build-dir = /nix/build
+            extra-platforms = aarch64-linux
+            # auto-optimise-store is deliberately OFF in CI. It hardlink-dedupes
+            # every store file into /nix/store/.links, and that hardlink farm
+            # does not round-trip cleanly through the cache-nix-action archive:
+            # small, widely-shared files (bash patch .drvs, stdenv's strip.sh)
+            # are exactly the ones that get deduped, and they come back missing
+            # while db.sqlite still lists them as valid. Nix then trusts the db,
+            # never re-substitutes, and a test step dies with
+            # "store path '...-bash53-003.drv' does not exist".
+            experimental-features = nix-command flakes
+            access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
+            download-attempts = 15
+            http-connections = 25
+            connect-timeout = 30
+            extra-substituters = https://catppuccin.cachix.org https://pierre-nixos.cachix.org
+            extra-trusted-public-keys = catppuccin.cachix.org-1:noG/4HkbhJb+lUAdKrph6LaozJvAeEEZj4N732n/9sI= pierre-nixos.cachix.org-1:54bU6/gPbvP4X+nu2apEx343noMoo3Jln8LzYfKD7ks=
+
+      # Restore only - build.yml owns saving and purging the nix store caches;
+      # saving here too would purge build.yml's run-suffixed caches (and vice
+      # versa) since both match the nix-Linux- prefix.
+      - uses: nix-community/cache-nix-action/restore@v7
+        id: cache_restore
+        continue-on-error: true
+        with:
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.lock') }}
+          # Only ever restore a store snapshot taken under the SAME flake.lock.
+          # The old catch-all `nix-${{ runner.os }}-` fallback pulled in stores
+          # from arbitrary older runs (including build.yml's timeout-killed
+          # ones, which save on purpose for retry-resume); cache-nix-action
+          # *merges* the restored db.sqlite into the live one, so those stale
+          # rows became phantom "valid" entries for paths the archive never
+          # carried - surfacing here as "store path ... does not exist".
+          restore-prefixes-first-match: |
+            nix-${{ runner.os }}-${{ hashFiles('flake.lock') }}
+
+      - name: Verify Restored Store
+        run: |
+          # Heal a restored store whose db.sqlite claims paths that aren't on
+          # disk. --repair is load-bearing: plain `--verify` only invalidates a
+          # missing path when NOTHING valid still refers to it; a
+          # missing-but-referenced path is merely reported as "disappeared, but
+          # it still has valid referrers!" and left registered, so Nix keeps
+          # believing it exists and never substitutes it. The failure then
+          # surfaces later, in whichever test first has to realise a
+          # derivation. No --check-contents: it re-hashes the whole store.
+          # Best-effort: verify being unavailable must not fail the job.
+          sudo -i nix-store --verify --repair || sudo /nix/var/nix/profiles/default/bin/nix-store --verify --repair || true
+
+      - name: "Test: minimal-defaults"
+        id: minimal-defaults
+        continue-on-error: true
+        run: bash templates/tests/nixos/test-minimal-defaults/check-nixos-minimal-defaults.sh
+
+      - name: "Test: spec-contract"
+        id: spec-contract
+        continue-on-error: true
+        run: bash templates/tests/nixos/test-spec-contract/check-nixos-spec-contract.sh
+
+      - name: "Test: conflicting-modules"
+        id: conflicting-modules
+        continue-on-error: true
+        run: nix run github:danielefongo/nix-tests --inputs-from . --override-input nixpkgs nixpkgs -- templates/tests/nixos/conflicting-modules
+
+      - name: "Test: custom-shells"
+        id: custom-shells
+        continue-on-error: true
+        run: nix run github:danielefongo/nix-tests --inputs-from . --override-input nixpkgs nixpkgs -- templates/tests/nixos/test-custom-shells
+
+      - name: "Test: arch-compat (aarch64)"
+        id: arch-compat
+        continue-on-error: true
+        run: bash templates/tests/nixos/test-arch-compat/check-nixos-aarch64-compat.sh
+
+      - name: "Test: wallpapers"
+        id: wallpapers
+        continue-on-error: true
+        run: nix run github:danielefongo/nix-tests --inputs-from . --override-input nixpkgs nixpkgs -- templates/tests/nixos/test-nixos-wallpapers
+
+      - name: Summary and notify on failure
+        # always() && WEBHOOK_ID: on a fork without secrets the webhook URL is
+        # malformed, so this would curl a broken endpoint on every single run.
+        # continue-on-error: a Discord outage must never turn a passing test
+        # suite into a failed job - the notice is secondary to the result.
+        if: always() && env.WEBHOOK_ID != ''
+        continue-on-error: true
+        env:
+          WEBHOOK_URL: https://discord.com/api/webhooks/${{ secrets.DISCORD_WEBHOOK_ID }}/${{ secrets.DISCORD_WEBHOOK_TOKEN }}
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          MINIMAL_OUTCOME: ${{ steps.minimal-defaults.outcome }}
+          SPEC_OUTCOME: ${{ steps.spec-contract.outcome }}
+          CONFLICT_OUTCOME: ${{ steps.conflicting-modules.outcome }}
+          SHELLS_OUTCOME: ${{ steps.custom-shells.outcome }}
+          ARCH_OUTCOME: ${{ steps.arch-compat.outcome }}
+          WALLPAPERS_OUTCOME: ${{ steps.wallpapers.outcome }}
+        run: |
+
+          FAILED=()
+          SKIPPED=()
+
+          # A test that never RAN is not a test that FAILED. Before this, any
+          # earlier step dying skipped every test and the summary then announced
+          # six failures that had not happened - a Discord notice naming six
+          # broken tests when none had executed. Classify the two separately.
+          # Appended inside `if` blocks, never as `[[ ... ]] &&`: under `bash -e`
+          # a false test makes that list return non-zero and aborts the step at
+          # the first line that does not apply.
+          classify() {
+            case "$2" in
+              success) ;;
+              skipped) SKIPPED+=("-  $1") ;;
+              *)       FAILED+=("✗  $1") ;;
+            esac
+          }
+          classify "minimal-defaults"     "$MINIMAL_OUTCOME"
+          classify "spec-contract"        "$SPEC_OUTCOME"
+          classify "conflicting-modules"  "$CONFLICT_OUTCOME"
+          classify "custom-shells"        "$SHELLS_OUTCOME"
+          classify "arch-compat (aarch64)" "$ARCH_OUTCOME"
+          classify "wallpapers"           "$WALLPAPERS_OUTCOME"
+
+          if [[ ${#SKIPPED[@]} -gt 0 ]]; then
+            echo "::warning::${#SKIPPED[@]} test(s) never ran - an earlier step failed: ${SKIPPED[*]}"
+            FAILED+=("${SKIPPED[@]}")
+          fi
+
+          if [[ ${#FAILED[@]} -eq 0 ]]; then
+            echo "All NixOS tests passed."
+            exit 0
+          fi
+
+          echo "Not passing: ${FAILED[*]}"
+
+          if [[ -n "$WEBHOOK_ID" ]]; then
+            REPORT=$(printf '%s\n' "${FAILED[@]}")
+            jq -n \
+              --arg report "$REPORT" \
+              --arg ref "$REF_NAME" \
+              --arg event "$EVENT_NAME" \
+              --arg url "$RUN_URL" \
+              '{content: "🧪 **NixOS Tests Failed** | `\($ref)` (\($event))\n```\n\($report)\n```\n🔗 \($url)"}' \
+              > payload.json
+            # --fail so a rotated/revoked webhook is not reported as delivered, and
+          # `|| echo` so the notice never fails the step (and is never the last
+          # command left returning non-zero under bash -e).
+          curl -sS --fail -H "Content-Type: application/json" -d @payload.json "$WEBHOOK_URL" \
+            || echo "::warning::Discord webhook delivery failed - the notification above was NOT sent."
+          fi
+
+          exit 1

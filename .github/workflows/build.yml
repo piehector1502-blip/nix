@@ -1,0 +1,1302 @@
+name: "Build NixOS Configurations, push to cachix and flake checks"
+env:
+  CACHIX_NAME: pierre-nixos
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+on:
+  push:
+    branches: [develop, main]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 5 * * 5"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Evaluation-only (this flake exposes no `checks` output), so it needs far
+  # less time and disk than the build job and runs in parallel with it.
+  flake-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      NIXPKGS_ALLOW_UNFREE: 1
+      WEBHOOK_ID: ${{ secrets.DISCORD_WEBHOOK_ID }}
+      CURL_HTTP_VERSION: 1.1
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install CA Certificates
+        continue-on-error: true
+        # timeout-minutes is load-bearing, not decoration. continue-on-error and
+        # the `|| true` below cover this step FAILING; neither covers it HANGING.
+        # Run 1130 lost a whole job to exactly that: apt-get stalled on an
+        # unreachable mirror and the step sat for 27+ minutes, holding the job
+        # toward its 180-minute cap AND blocking every later run in the same
+        # concurrency group - and because the runner itself was unreachable, a
+        # manual Cancel could not be delivered either.
+        timeout-minutes: 5
+        run: |
+          # Best-effort freshness refresh: ca-certificates is preinstalled on
+          # the runner image and Nix uses its own CA bundle (NIX_SSL_CERT_FILE),
+          # so a broken third-party apt repo (packages.microsoft.com,
+          # dl.google.com, ...) must never fail the job. Worst case we keep
+          # the image's cert bundle - exactly what we'd have without this step.
+          # shellcheck disable=SC2046  # word splitting is REQUIRED here:
+          # grep -l can list several files and each must be its own argument.
+          sudo rm -f $(grep -lr packages.microsoft.com /etc/apt/sources.list.d/ 2>/dev/null) || true
+          sudo apt-get update || true
+          sudo apt-get install -y ca-certificates || true
+
+      - name: Set up QEMU
+        continue-on-error: true
+        uses: docker/setup-qemu-action@v3
+
+      - name: Add Swap
+        continue-on-error: true
+        run: |
+          # GitHub-hosted runners ship with an active swap file, so fallocate
+          # on /swapfile fails with "Text file busy" (ETXTBSY). Disable and
+          # remove any existing swap first, then build a fresh swap file with
+          # dd (the kernel-recommended method that avoids holes/ETXTBSY).
+          sudo swapoff -a || true
+          sudo rm -f /swapfile
+          sudo dd if=/dev/zero of=/swapfile bs=1M count=8192 status=progress
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          free -h
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+        with:
+          flakehub: false
+          extra-conf: |
+            build-dir = /nix/build
+            extra-platforms = aarch64-linux
+            # auto-optimise-store is deliberately OFF in CI. It hardlink-dedupes
+            # every store file into /nix/store/.links, and that hardlink farm
+            # does not round-trip cleanly through the cache-nix-action archive:
+            # small, widely-shared files (stdenv's strip.sh, bash patch .drvs)
+            # are exactly the ones that get deduped, and they come back missing
+            # while db.sqlite still lists them as valid. Nix then trusts the db,
+            # never re-substitutes, and the first step that actually *builds*
+            # dies with "path ... does not exist". Disk is not the constraint
+            # here (nothing-but-nix frees ~60 GB), so dedup buys us nothing.
+            # Keep .drv files and build-time deps out of GC so a saved store
+            # cache never has db entries pointing at pruned files (the
+            # cache-nix-action-recommended guard against exactly the
+            # "user-environment.drv does not exist" failure on restore).
+            keep-outputs = true
+            keep-derivations = true
+            # The same extra substituters the real machines trust, from
+            # modules/nixos/toplevel/nix-nixos.nix. CI had NONE of them, so it
+            # COMPILED FROM SOURCE what every one of your machines simply
+            # downloads - run 1095 shows vicinae-0.25.0 being built locally
+            # even though vicinae publishes a cachix. Nothing new is trusted
+            # here: this is exactly the set already in the system config, with
+            # the same public keys.
+            #
+            # Note this is NOT covered by --accept-flake-config, which the
+            # builds do not pass (only `nix profile install` does), so an input
+            # flake's own nixConfig.extra-substituters is ignored regardless.
+            extra-substituters = https://hyprland.cachix.org https://cosmic.cachix.org https://walker.cachix.org https://claude-code.cachix.org https://vicinae.cachix.org https://catppuccin.cachix.org
+            extra-trusted-public-keys = hyprland.cachix.org-1:a7pgxzMz7+chwVL3/pzj6jIBMioiJM7ypFP8PwtkuGc= cosmic.cachix.org-1:Dya9IyXD4xdBehWjrkPv6rtxpmMdRel02smYzA85dPE= walker.cachix.org-1:fG8q+uAaMqhsMxWjwvk0IMb4mFPFLqHjuvfwQxE4oJM= claude-code.cachix.org-1:YeXf2aNu7UTX8Vwrze0za1WEDS+4DuI2kVeWEE4fsRk= vicinae.cachix.org-1:1kDrfienkGHPYbkpNj1mWTr7Fm1+zcenzgTizIcI3oc= catppuccin.cachix.org-1:noG/4HkbhJb+lUAdKrph6LaozJvAeEEZj4N732n/9sI=
+            experimental-features = nix-command flakes
+            access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
+            download-attempts = 15
+            http-connections = 25
+            connect-timeout = 30
+
+      # Restore only - the build job owns saving, so the two jobs never race
+      # on cache writes. Non-critical: a broken/corrupted cache archive must
+      # not fail this job, just slow it down to a cold build.
+      - name: Restore Nix Store Cache
+        id: cache_restore
+        continue-on-error: true
+        uses: nix-community/cache-nix-action/restore@v7
+        with:
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.lock') }}-${{ github.run_id }}-${{ github.run_attempt }}
+          # Only ever restore a store snapshot taken under the SAME flake.lock.
+          # The old catch-all `nix-${{ runner.os }}-` fallback pulled in stores
+          # from arbitrary older runs (and from timeout-killed jobs, which save
+          # on purpose for retry-resume); cache-nix-action *merges* the restored
+          # db.sqlite into the live one, so those stale rows became phantom
+          # "valid" entries for paths the archive never carried.
+          restore-prefixes-first-match: |
+            nix-${{ runner.os }}-${{ hashFiles('flake.lock') }}
+
+      - name: Verify Restored Store
+        # Best-effort, and now declared as such. The `|| true` below already
+        # made this practically unfailable, but the guarantee lived in the
+        # command rather than the step: drop that `|| true` in a future edit
+        # and a store-verify hiccup would silently skip the Cachix push AND
+        # the store-cache save, because neither carries a status function that
+        # survives a hard failure here.
+        continue-on-error: true
+        run: |
+          # A restored cache can carry db registrations whose files never
+          # made it into the archive (snapshot of a killed build - bit us on
+          # 2026-07-07 as "user-environment.drv does not exist" in cachix's
+          # nix-env install). --repair is load-bearing: plain `--verify` only
+          # invalidates a missing path when NOTHING valid still refers to it.
+          # A missing-but-referenced path (stdenv's strip.sh) is merely
+          # reported as "disappeared, but it still has valid referrers!" and
+          # left registered, so Nix keeps believing it exists and never
+          # substitutes it - which is why the failure only surfaced later, at
+          # the first step that actually builds something (the doom-emacs IFD).
+          # --repair re-downloads those paths instead. No --check-contents: it
+          # re-hashes the entire store and is far too slow here.
+          # Best-effort: verify being unavailable must not fail the job.
+          sudo -i nix-store --verify --repair || sudo /nix/var/nix/profiles/default/bin/nix-store --verify --repair || true
+
+      # Non-critical: only used to speed up this job via the binary cache
+      # substituter. A failed install must not fail the flake check.
+      - name: Set up Cachix
+        id: cachix_setup
+        continue-on-error: true
+        env:
+          CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
+        run: |
+          nix profile install --accept-flake-config nixpkgs#cachix
+          # NOT fatal, and deliberately so. `cachix use` configures this cache as
+          # a SUBSTITUTER - it affects downloading and has nothing to do with
+          # pushing. Every push step in this workflow is gated on this step's
+          # outcome, so letting `cachix use` fail the step meant a transient
+          # substituter-config hiccup silently disabled ALL pushing even with a
+          # perfectly valid token. The gate now reflects what it claims to:
+          # whether the cachix CLI is installed and usable.
+          cachix use ${{ env.CACHIX_NAME }} \
+            || echo "::warning::cachix use failed - this cache is not configured as a substituter for this job. Pushing is unaffected."
+
+      # continue-on-error so the push below still runs. `nix flake check
+      # --all-systems` realises real derivations (IFD, every host's closure
+      # roots), and until now this job threw all of that away on both success
+      # AND failure - it had no push step at all. Its outcome is re-asserted
+      # by the status gate further down, so a genuine breakage still turns the
+      # job red and fires the Discord notice - just after the cache is warm.
+      - name: Check Flake
+        id: flake_check
+        continue-on-error: true
+        run: nix flake check --all-systems --show-trace
+
+      # This job builds real store paths and previously cached none of them.
+      # Pushing them means build-x86_64 and the next run substitute instead of
+      # rebuilding. Never fails the job: it is a cache optimisation.
+      - name: Push Flake Check Output to Cachix
+        id: cachix_push
+        if: always() && steps.cachix_setup.outcome == 'success'
+        continue-on-error: true
+        env:
+          CACHIX_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
+        run: |
+          # pipefail: the `| tee` below would otherwise mask cachix's exit code,
+          # reintroducing exactly the silent-success failure this step exists
+          # to avoid.
+          set -o pipefail
+
+          if [ -z "$CACHIX_TOKEN" ]; then
+            echo "Skipping Cachix push: no auth token found (likely a fork)."
+            echo "pushed=skipped" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # No single output path to name here - flake check has many roots -
+          # so push the store. Upstream-cache filtering keeps this to what this
+          # run actually produced rather than a copy of nixpkgs.
+          # -self-test-: the Determinate installer writes a self-test path per
+          # run whose name carries a timestamp (self-test-bash-1787097653189,
+          # self-test-zsh-...), so it is a brand-new store path every single
+          # run. Observed being pushed on both platforms; left in, it grows the
+          # cache without bound for no benefit, since nothing ever substitutes
+          # it. Everything else the installer produces is version-stable and
+          # deduplicates, so a narrow exclusion is enough.
+          # Not a bare pipeline: GitHub runs these with `bash -e`, not
+          # `-o pipefail`, so a failing `nix path-info` would be masked - cachix
+          # would read empty stdin, report nothing to push and exit 0, and the
+          # run would look fine while caching nothing. Materialise the list
+          # first so that failure is visible.
+          if ! nix path-info --all > allpaths.txt; then
+            echo "::warning::nix path-info failed - nothing could be pushed this run."
+            echo "pushed=error" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          grep -v -e '\.drv$' -e '-self-test-' allpaths.txt > topush.txt || true
+          if [ ! -s topush.txt ]; then
+            echo "Nothing left to push after filtering."
+            echo "pushed=0" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          cachix push ${{ env.CACHIX_NAME }} < topush.txt 2>&1 | tee push.log
+          # Anchored on the store path on purpose: `cachix push` prints a summary
+          # header ("Pushing 14 paths (2089 are already present) ... ") as well as one
+          # `Pushing /nix/store/...` line per path, so a bare '^Pushing ' counted N+1.
+          # Run 1136's flake-check reported pushed=15 when exactly 14 paths went up.
+          echo "pushed=$(grep -c '^Pushing /nix/store/' push.log || true)" >> "$GITHUB_OUTPUT"
+
+      - name: Check for Dead Code (deadnix)
+        continue-on-error: true
+        run: |
+          NO_COLOR=1 nix run --inputs-from . nixpkgs#deadnix -- . > deadnix_report.txt || true
+          # Quoted, and grouped into one redirect: every other GITHUB_OUTPUT /
+          # GITHUB_ENV write in these workflows quotes the path, and this was the
+          # only place that did not.
+          if [ -s deadnix_report.txt ]; then
+            {
+              echo "HAS_DEAD_CODE=true"
+              echo "DEADCODE_REPORT<<EOF"
+              head -n 20 deadnix_report.txt
+              echo "EOF"
+            } >> "$GITHUB_ENV"
+          else
+            echo "HAS_DEAD_CODE=false" >> "$GITHUB_ENV"
+          fi
+
+      - name: Report Flake Check Status
+        if: always()
+        run: |
+          if [ "${{ steps.flake_check.outcome }}" = "failure" ]; then
+            echo "::error::nix flake check failed (its build output was still pushed to Cachix)"
+            exit 1
+          fi
+          echo "flake check: ${{ steps.flake_check.outcome }}"
+
+      # ONE consolidated notice per job, replacing the previous separate ones.
+      # The old split was structurally unsound: hard failures fired on
+      # failure() while infra problems fired on success(), so a FAILED job
+      # suppressed the infra report entirely - you would never learn that
+      # Cachix had broken too. It also let a condition name a step the message
+      # body never mentioned, which is how a notice could fire listing nothing.
+      # Collecting every finding in the same step that decides whether to send
+      # removes both classes of bug.
+      #
+      # Silent on a clean run: no findings, no message.
+      #
+      # Shell note: findings are appended inside `if` blocks, never as
+      # `[ test ] && append`. Under `bash -e` a false test makes that an `&&`
+      # list returning non-zero, which aborts the step - the notifier would
+      # stop at the first finding that did not apply.
+      - name: Notify (flake-check)
+        if: always() && env.WEBHOOK_ID != ''
+        continue-on-error: true
+        env:
+          WEBHOOK_URL: https://discord.com/api/webhooks/${{ secrets.DISCORD_WEBHOOK_ID }}/${{ secrets.DISCORD_WEBHOOK_TOKEN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          CRIT=""; WARN=""; INFO=""; NOTE=""
+          crit() { CRIT="${CRIT}🔴 $1"$'\n'; }
+          warn() { WARN="${WARN}🟠 $1"$'\n'; }
+          info() { INFO="${INFO}🔵 $1"$'\n'; }
+          # note() rides along in a message that is being sent anyway, but never
+          # causes one on its own. Routine facts - "0 new paths, everything was
+          # already cached" - are true on every warm run, so promoting them to a
+          # trigger would mean a Discord message after every single green build,
+          # and a channel nobody reads is the same as no notifications at all.
+          note() { NOTE="${NOTE}⚪ $1"$'\n'; }
+          if [ "${{ steps.flake_check.outcome }}" = "failure" ]; then
+            crit "\`nix flake check --all-systems\` failed - its build output was still pushed to Cachix"
+          fi
+          if [ "${{ steps.cachix_setup.outcome }}" = "failure" ]; then
+            warn "Cachix CLI setup failed - nothing could be pushed this run"
+          fi
+          if [ "${{ steps.cachix_push.outcome }}" = "failure" ]; then
+            warn "Cachix push failed - flake check output was not cached"
+          fi
+          if [ "${{ steps.cache_restore.outcome }}" = "failure" ]; then
+            warn "Nix store cache restore failed - this run evaluated cold"
+          fi
+          P="${{ steps.cachix_push.outputs.pushed }}"
+          if [ "$P" = "error" ]; then
+            warn "\`nix path-info\` failed - the store could not be listed, so nothing was pushed"
+          elif [ "$P" = "0" ]; then
+            note "Cachix push uploaded 0 new paths"
+          elif [ -n "$P" ] && [ "$P" != "skipped" ]; then
+            note "Pushed $P new store path(s) to Cachix"
+          fi
+          if [ "${{ env.HAS_DEAD_CODE }}" = "true" ]; then
+            info "Dead Nix code detected:"$'\n'"\`\`\`text"$'\n'"$DEADCODE_REPORT"$'\n'"\`\`\`"
+          fi
+
+          # Send decision uses CRIT/WARN/INFO only; NOTE rides along.
+          BODY="${CRIT}${WARN}${INFO}${NOTE}"
+          if [ -z "${CRIT}${WARN}${INFO}" ]; then
+            echo "Nothing to report - no notification sent."
+            exit 0
+          fi
+          if [ -n "$CRIT" ]; then
+            HEAD="🚨 **flake-check - failed**"
+          elif [ -n "$WARN" ]; then
+            HEAD="⚠️ **flake-check - finished, but with problems**"
+          else
+            HEAD="ℹ️ **flake-check**"
+          fi
+          jq -n --arg h "$HEAD" --arg b "$BODY" --arg u "$RUN_URL" \
+            '{content: ($h + "\n" + $b + "\n" + $u)}' > payload.json
+          # --fail so a rotated/revoked webhook is not reported as delivered, and
+          # `|| echo` so the notice never fails the step (and is never the last
+          # command left returning non-zero under bash -e).
+          curl -sS --fail -H "Content-Type: application/json" -d @payload.json "$WEBHOOK_URL" \
+            || echo "::warning::Discord webhook delivery failed - the notification above was NOT sent."
+
+  # Builds the handful of large, independently-buildable packages in the
+  # nixos-laptop closure (mostly Electron apps) in parallel, each with its
+  # own timeout, and pushes them to Cachix before the main build starts. On
+  # a cache-miss run (nixpkgs bump, cache outage, ...) this turns what used
+  # to be serial rebuilding inside the single 270-minute build step into
+  # several short parallel legs, so build-x86_64 mostly substitutes instead
+  # of building. On a normal cache-hit run these legs no-op almost instantly
+  # - the only cost is a bit of job-scheduling overhead. Never blocks the
+  # main build: a failed/timed-out leg here just means that one package
+  # rebuilds inside build-x86_64 as before.
+  prewarm-cache:
+    runs-on: ubuntu-latest
+    # prewarm-cache runs BEFORE build-x86_64 (needs:), so its cap adds to the
+    # build's on the critical path. 60 + 180 keeps the whole serial chain under
+    # four hours, comfortably clear of the ~300-minute mark and of GitHub's
+    # 360-minute hard kill.
+    #
+    # A leg that hits this cap is not wasted: watch-exec has already uploaded
+    # everything it built, so the next run starts further along. That is exactly
+    # the property that lets the cap be tight.
+    timeout-minutes: 60
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        attr:
+          - vscode
+          - obs-studio
+          - libreoffice-qt
+          - teams-for-linux
+          - vesktop
+          - signal-desktop
+          - tor-browser
+          # Added on evidence, not guesswork: thunderbird-unwrapped is what run
+          # 754 spent its entire 300-minute budget compiling when nixpkgs had
+          # bumped ahead of Hydra. It is ~340 MiB and exactly the Hydra-lag
+          # window this matrix exists to cover.
+          - thunderbird
+    env:
+      NIXPKGS_ALLOW_UNFREE: 1
+      # Needed by the notifier below. Without it env.WEBHOOK_ID is empty and
+      # the notice never fires - which is why this job stayed silent while its
+      # push step failed on every leg of every run.
+      WEBHOOK_ID: ${{ secrets.DISCORD_WEBHOOK_ID }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+        with:
+          flakehub: false
+          extra-conf: |
+            # The same extra substituters the real machines trust, from
+            # modules/nixos/toplevel/nix-nixos.nix. CI had NONE of them, so it
+            # COMPILED FROM SOURCE what every one of your machines simply
+            # downloads - run 1095 shows vicinae-0.25.0 being built locally
+            # even though vicinae publishes a cachix. Nothing new is trusted
+            # here: this is exactly the set already in the system config, with
+            # the same public keys.
+            #
+            # Note this is NOT covered by --accept-flake-config, which the
+            # builds do not pass (only `nix profile install` does), so an input
+            # flake's own nixConfig.extra-substituters is ignored regardless.
+            extra-substituters = https://hyprland.cachix.org https://cosmic.cachix.org https://walker.cachix.org https://claude-code.cachix.org https://vicinae.cachix.org https://catppuccin.cachix.org
+            extra-trusted-public-keys = hyprland.cachix.org-1:a7pgxzMz7+chwVL3/pzj6jIBMioiJM7ypFP8PwtkuGc= cosmic.cachix.org-1:Dya9IyXD4xdBehWjrkPv6rtxpmMdRel02smYzA85dPE= walker.cachix.org-1:fG8q+uAaMqhsMxWjwvk0IMb4mFPFLqHjuvfwQxE4oJM= claude-code.cachix.org-1:YeXf2aNu7UTX8Vwrze0za1WEDS+4DuI2kVeWEE4fsRk= vicinae.cachix.org-1:1kDrfienkGHPYbkpNj1mWTr7Fm1+zcenzgTizIcI3oc= catppuccin.cachix.org-1:noG/4HkbhJb+lUAdKrph6LaozJvAeEEZj4N732n/9sI=
+            experimental-features = nix-command flakes
+            access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
+            download-attempts = 15
+            http-connections = 25
+            connect-timeout = 30
+
+      - name: Set up Cachix
+        id: cachix_setup
+        continue-on-error: true
+        env:
+          CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
+        run: |
+          nix profile install --accept-flake-config nixpkgs#cachix
+          # NOT fatal, and deliberately so. `cachix use` configures this cache as
+          # a SUBSTITUTER - it affects downloading and has nothing to do with
+          # pushing. Every push step in this workflow is gated on this step's
+          # outcome, so letting `cachix use` fail the step meant a transient
+          # substituter-config hiccup silently disabled ALL pushing even with a
+          # perfectly valid token. The gate now reflects what it claims to:
+          # whether the cachix CLI is installed and usable.
+          cachix use ${{ env.CACHIX_NAME }} \
+            || echo "::warning::cachix use failed - this cache is not configured as a substituter for this job. Pushing is unaffected."
+
+      # Built via the flake's own nixosConfigurations.nixos-laptop.pkgs
+      # rather than plain nixpkgs#<attr>, so this is the exact same
+      # derivation (overlays, unfree allowance, system) build-x86_64 would
+      # otherwise build - not a look-alike from a different pkgs instantiation.
+      # Under `cachix watch-exec`: a Nix post-build hook uploads each path the
+      # moment it is built, so a leg that fails or is killed by the timeout
+      # still leaves everything it completed in the cache. Successive runs then
+      # start further along the dependency chain instead of from the same
+      # place. The end-of-step push below stays as a backstop.
+      - name: Pre-warm ${{ matrix.attr }}
+        id: prewarm
+        # 45 leaves a ~15-minute tail inside the 60-minute job cap for the
+        # backstop push.
+        continue-on-error: true
+        timeout-minutes: 45
+        env:
+          CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
+        run: |
+          # Probe first: `cachix watch-exec` failing would be indistinguishable
+          # from the build failing, and a cachix problem must never be reported
+          # as a broken config. If the subcommand isn't usable, build plainly -
+          # the end-of-job push still populates the cache either way.
+          WATCH=0
+          if [ "${{ steps.cachix_setup.outcome }}" = "success" ] && [ -n "$CACHIX_AUTH_TOKEN" ] \
+             && cachix watch-exec --help > /dev/null 2>&1; then
+            WATCH=1
+          fi
+          BUILD='nix build .#nixosConfigurations.nixos-laptop.pkgs.${{ matrix.attr }} --no-link --print-out-paths --keep-going > out.txt'
+          if [ "$WATCH" = 1 ]; then
+            echo "Building under 'cachix watch-exec' - paths are pushed as they are built."
+            # pipefail BEFORE this pipe is mandatory, not stylistic: under the
+            # default `bash -e` shell a failing build piped into tee exits 0, so
+            # a broken config would be reported as a green build. Verified
+            # locally: `bash -e -c 'false | tee /dev/null'` exits 0.
+            set -o pipefail
+            cachix watch-exec ${{ env.CACHIX_NAME }} -- bash -c "$BUILD" 2>&1 | tee watch.log
+          else
+            bash -c "$BUILD"
+          fi
+
+      # Makes the continuous-push property observable on every run instead of
+      # something that has to be re-derived by hand from raw logs. watch.log is
+      # watch-exec's own output: its Nix post-build hook prints one
+      # "Pushing /nix/store/..." line per path it uploads WHILE the build runs.
+      #
+      # The alarm below is the point of the step. Nix does not fire the hook for
+      # substituted paths, so streamed=0 on a warm run is normal and means
+      # nothing. streamed=0 while the build genuinely built derivations is the
+      # signal that continuous push is broken - and that is precisely the case
+      # that is invisible without this check, because the end-of-job backstop
+      # push then quietly covers for it.
+      - name: Report Continuous Push (watch-exec)
+        id: watch_report
+        if: always()
+        continue-on-error: true
+        run: |
+          if [ ! -f watch.log ]; then
+            echo "No watch.log - this build did not run under continuous push (watch-exec)."
+            echo "streamed=n/a" >> "$GITHUB_OUTPUT"
+            echo "built=n/a" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Anchored on the store path for the same reason the push steps are:
+          # cachix also prints a "Pushing N paths (...)" summary header.
+          STREAMED=$(grep -c '^Pushing /nix/store/' watch.log || true)
+          BUILT=$(grep -c "^building '/nix/store/" watch.log || true)
+          echo "watch-exec streamed $STREAMED path(s) to Cachix during the build"
+          echo "($BUILT derivation(s) were actually built; substituted paths never fire the hook)"
+          echo "streamed=$STREAMED" >> "$GITHUB_OUTPUT"
+          echo "built=$BUILT" >> "$GITHUB_OUTPUT"
+          if [ "$BUILT" -gt 0 ] && [ "$STREAMED" -eq 0 ]; then
+            echo "::warning::watch-exec streamed 0 paths despite building $BUILT derivation(s) - continuous push is not working, so a killed or cancelled run will lose everything it built."
+          fi
+
+      - name: Push ${{ matrix.attr }} to Cachix
+        id: prewarm_push
+        if: always() && steps.cachix_setup.outcome == 'success'
+        continue-on-error: true
+        env:
+          # CACHIX_AUTH_TOKEN is the one cachix actually reads. Without it this
+          # step failed with "Neither auth token nor signing key are present."
+          # on every leg of every run, and continue-on-error hid it - the job
+          # still reported success while pushing nothing. CACHIX_TOKEN is only
+          # this script's own "is a token configured" guard.
+          CACHIX_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
+        run: |
+          # pipefail: the `| tee` below would otherwise mask cachix's exit code,
+          # reintroducing exactly the silent-success failure this step exists
+          # to avoid.
+          set -o pipefail
+
+          if [ -z "$CACHIX_TOKEN" ]; then
+            echo "Skipping Cachix push: no auth token found (likely a fork)."
+            echo "pushed=skipped" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ -s out.txt ]; then
+          # shellcheck disable=SC2046  # word splitting is REQUIRED here:
+            # one store path per line must become one argument per path.
+            # Quoting would pass the whole file as a single argument.
+            cachix push ${{ env.CACHIX_NAME }} $(cat out.txt) 2>&1 | tee push.log
+            # Anchored on the store path on purpose: `cachix push` prints a summary
+            # header ("Pushing 14 paths (2089 are already present) ... ") as well as one
+            # `Pushing /nix/store/...` line per path, so a bare '^Pushing ' counted N+1.
+            # Run 1136's flake-check reported pushed=15 when exactly 14 paths went up.
+            echo "pushed=$(grep -c '^Pushing /nix/store/' push.log || true)" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # ${{ matrix.attr }} itself didn't finish, so there is no output
+          # path - but its dependencies that DID build are the expensive part
+          # and are exactly what this leg exists to warm. Push them rather
+          # than discarding the whole leg. Upstream-cache filtering keeps this
+          # to what actually got built here.
+          echo "No output path for ${{ matrix.attr }} - pushing every valid store path instead."
+          # -self-test-: the Determinate installer writes a self-test path per
+          # run whose name carries a timestamp (self-test-bash-1787097653189,
+          # self-test-zsh-...), so it is a brand-new store path every single
+          # run. Observed being pushed on both platforms; left in, it grows the
+          # cache without bound for no benefit, since nothing ever substitutes
+          # it. Everything else the installer produces is version-stable and
+          # deduplicates, so a narrow exclusion is enough.
+          # Not a bare pipeline: GitHub runs these with `bash -e`, not
+          # `-o pipefail`, so a failing `nix path-info` would be masked - cachix
+          # would read empty stdin, report nothing to push and exit 0, and the
+          # run would look fine while caching nothing. Materialise the list
+          # first so that failure is visible.
+          if ! nix path-info --all > allpaths.txt; then
+            echo "::warning::nix path-info failed - nothing could be pushed this run."
+            echo "pushed=error" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          grep -v -e '\.drv$' -e '-self-test-' allpaths.txt > topush.txt || true
+          if [ ! -s topush.txt ]; then
+            echo "Nothing left to push after filtering."
+            echo "pushed=0" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          cachix push ${{ env.CACHIX_NAME }} < topush.txt 2>&1 | tee push.log
+          # Anchored on the store path on purpose: `cachix push` prints a summary
+          # header ("Pushing 14 paths (2089 are already present) ... ") as well as one
+          # `Pushing /nix/store/...` line per path, so a bare '^Pushing ' counted N+1.
+          # Run 1136's flake-check reported pushed=15 when exactly 14 paths went up.
+          echo "pushed=$(grep -c '^Pushing /nix/store/' push.log || true)" >> "$GITHUB_OUTPUT"
+
+      # This job had NO notification at all, which is exactly why its push step
+      # could fail with "Neither auth token nor signing key are present." on
+      # every leg of every run without anyone noticing: the job is
+      # continue-on-error at the job level, so its own red status is invisible
+      # in the workflow result too. Reports per matrix leg, and only when
+      # there is something wrong - a warm leg with nothing to push is silent.
+      - name: Notify (pre-warm ${{ matrix.attr }})
+        if: always() && env.WEBHOOK_ID != ''
+        continue-on-error: true
+        env:
+          WEBHOOK_URL: https://discord.com/api/webhooks/${{ secrets.DISCORD_WEBHOOK_ID }}/${{ secrets.DISCORD_WEBHOOK_TOKEN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          WARN=""
+          warn() { WARN="${WARN}🟠 $1"$'\n'; }
+
+          if [ "${{ steps.prewarm.outcome }}" = "failure" ]; then
+            warn "\`${{ matrix.attr }}\` failed to build - the main build will have to build it"
+          fi
+          if [ "${{ steps.cachix_setup.outcome }}" = "failure" ]; then
+            warn "Cachix CLI setup failed - this leg cached nothing"
+          fi
+          if [ "${{ steps.prewarm_push.outcome }}" = "failure" ]; then
+            warn "Cachix push failed - \`${{ matrix.attr }}\` was built but not cached"
+          fi
+          if [ "${{ steps.prewarm_push.outputs.pushed }}" = "error" ]; then
+            warn "\`nix path-info\` failed - nothing could be pushed"
+          fi
+
+          if [ -z "$WARN" ]; then
+            echo "Nothing to report - no notification sent."
+            exit 0
+          fi
+          jq -n --arg h "⚠️ **pre-warm ${{ matrix.attr }} - problem**" --arg b "$WARN" --arg u "$RUN_URL" \
+            '{content: ($h + "\n" + $b + "\n" + $u)}' > payload.json
+          # --fail so a rotated/revoked webhook is not reported as delivered, and
+          # `|| echo` so the notice never fails the step (and is never the last
+          # command left returning non-zero under bash -e).
+          curl -sS --fail -H "Content-Type: application/json" -d @payload.json "$WEBHOOK_URL" \
+            || echo "::warning::Discord webhook delivery failed - the notification above was NOT sent."
+
+  build-x86_64:
+    needs: prewarm-cache
+    # The pre-warm matrix is a pure speedup, never a correctness requirement
+    # - a failed/skipped/timed-out leg there must never block the real build.
+    if: always()
+    runs-on: ubuntu-latest
+    # ONE HOST PER RUNNER (the matrix below).
+    #
+    # An earlier run that built two systems in a single `nix build` made the
+    # runner DIE after 68 minutes: the job ended with "Build x86_64
+    # Configurations" still marked in_progress, "Push to Cachix" still marked
+    # pending, and the logs returning HTTP 404 because they were never uploaded.
+    # A single system alone built in 12m44s and pushed cleanly.
+    #
+    # That is the one failure mode always() does NOT cover. always() runs a
+    # step after a failure, a timeout, or a cancellation - but when the runner
+    # itself dies there is nothing left to run the step, so the push is lost
+    # outright. Keeping each job inside a resource envelope a runner survives
+    # is therefore a push-reliability measure, not a performance tweak.
+    #
+    # Why it blew up: this job deliberately sets keep-outputs/keep-derivations
+    # (see Install Nix below) so a saved store cache never references pruned
+    # files. That retains every INTERMEDIATE output, not just the runtime
+    # closure, and the ~78 GiB nothing-but-nix frees was sized for one system
+    # closure. Two closures' worth of retained intermediates does not fit.
+    #
+    # The matrix keeps that rule if a second host is ever added: one leg per
+    # host, independent failure domains, and fail-fast off so one host failing
+    # never cancels another's build, which would throw away exactly the paths
+    # we exist to cache.
+    strategy:
+      fail-fast: false
+      matrix:
+        host:
+          - nixos-laptop
+    # Capped well under the ~300-minute mark on purpose. A cold run (any
+    # flake.lock bump misses the store cache entirely) could otherwise approach
+    # GitHub's 360-minute hard kill, and a hard kill loses the cache-save step.
+    #
+    # Truncation is NOT data loss here, which is what makes a tight cap safe:
+    # cachix watch-exec has already uploaded every path as it was built, and the
+    # store cache still saves on a timeout, so the next run resumes further along
+    # the dependency chain. Progress is monotonic across runs - two bounded runs
+    # beat one five-hour run that risks the hard kill.
+    timeout-minutes: 180
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      NIXPKGS_ALLOW_UNFREE: 1
+      WEBHOOK_ID: ${{ secrets.DISCORD_WEBHOOK_ID }}
+      CURL_HTTP_VERSION: 1.1
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install CA Certificates
+        continue-on-error: true
+        # timeout-minutes is load-bearing, not decoration. continue-on-error and
+        # the `|| true` below cover this step FAILING; neither covers it HANGING.
+        # Run 1130 lost a whole job to exactly that: apt-get stalled on an
+        # unreachable mirror and the step sat for 27+ minutes, holding the job
+        # toward its 180-minute cap AND blocking every later run in the same
+        # concurrency group - and because the runner itself was unreachable, a
+        # manual Cancel could not be delivered either.
+        timeout-minutes: 5
+        run: |
+          # Best-effort freshness refresh: ca-certificates is preinstalled on
+          # the runner image and Nix uses its own CA bundle (NIX_SSL_CERT_FILE),
+          # so a broken third-party apt repo (packages.microsoft.com,
+          # dl.google.com, ...) must never fail the job. Worst case we keep
+          # the image's cert bundle - exactly what we'd have without this step.
+          # shellcheck disable=SC2046  # word splitting is REQUIRED here:
+          # grep -l can list several files and each must be its own argument.
+          sudo rm -f $(grep -lr packages.microsoft.com /etc/apt/sources.list.d/ 2>/dev/null) || true
+          sudo apt-get update || true
+          sudo apt-get install -y ca-certificates || true
+
+      - name: Set up QEMU
+        continue-on-error: true
+        uses: docker/setup-qemu-action@v3
+
+      - name: Open permissions on /mnt
+        continue-on-error: true
+        run: sudo chmod 1777 /mnt
+
+      - name: Add Swap
+        continue-on-error: true
+        run: |
+          # GitHub-hosted runners ship with an active swap file, so fallocate
+          # on /swapfile fails with "Text file busy" (ETXTBSY). Disable and
+          # remove any existing swap first, then build a fresh swap file with
+          # dd (the kernel-recommended method that avoids holes/ETXTBSY).
+          sudo swapoff -a || true
+          sudo rm -f /swapfile
+          sudo dd if=/dev/zero of=/swapfile bs=1M count=8192 status=progress
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          free -h
+
+      # root-safe-haven is the reason the store cache works at all. It defaults
+      # to 2048 (MB), and `cleave` hands everything else to the /nix btrfs - so
+      # the root filesystem sat at 145G total / 143G used / 1.7G free while /nix
+      # sat at 110G with 4.5G used. `Save Nix Store Cache` writes cache.tzst to
+      # the ROOT filesystem, so it ran out of space every single time:
+      #
+      #   Current store size in bytes: 6721367680.
+      #   ##[warning]You are running out of disk space. … Free space left: 60 MB
+      #   zstd: error 70 : Write error : cannot write block : No space left on device
+      #   ##[warning]Cache save failed.
+      #
+      # reported as step outcome `success` (see §11.4b), so nothing ever landed
+      # in the cache and every subsequent `Restore Nix Store Cache` completed in
+      # ONE SECOND - a miss. Runs 1142, 1143 and 1144 all show it.
+      #
+      # 12 GB of headroom covers a zstd-compressed store at the 7 GB
+      # gc-max-store-size ceiling with room to spare, and costs nothing: /nix
+      # keeps ~98G for a store that uses 4.5G.
+      - name: Maximize Nix Space
+        continue-on-error: true
+        uses: wimpysworld/nothing-but-nix@main
+        with:
+          hatchet-protocol: "cleave"
+          root-safe-haven: 12288
+          witness-carnage: true
+          nix-permission-edict: false
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+        with:
+          flakehub: false
+          extra-conf: |
+            build-dir = /nix/build
+            extra-platforms = aarch64-linux
+            # auto-optimise-store is deliberately OFF in CI - see the same
+            # comment in the flake-check job above. The hardlink farm it builds
+            # under /nix/store/.links does not survive the cache-nix-action
+            # archive round-trip, and this job is the one that *saves* the
+            # cache that every other workflow restores.
+            # Keep .drv files and build-time deps out of GC so a saved store
+            # cache never has db entries pointing at pruned files (the
+            # cache-nix-action-recommended guard against exactly the
+            # "user-environment.drv does not exist" failure on restore).
+            keep-outputs = true
+            keep-derivations = true
+            # The same extra substituters the real machines trust, from
+            # modules/nixos/toplevel/nix-nixos.nix. CI had NONE of them, so it
+            # COMPILED FROM SOURCE what every one of your machines simply
+            # downloads - run 1095 shows vicinae-0.25.0 being built locally
+            # even though vicinae publishes a cachix. Nothing new is trusted
+            # here: this is exactly the set already in the system config, with
+            # the same public keys.
+            #
+            # Note this is NOT covered by --accept-flake-config, which the
+            # builds do not pass (only `nix profile install` does), so an input
+            # flake's own nixConfig.extra-substituters is ignored regardless.
+            extra-substituters = https://hyprland.cachix.org https://cosmic.cachix.org https://walker.cachix.org https://claude-code.cachix.org https://vicinae.cachix.org https://catppuccin.cachix.org
+            extra-trusted-public-keys = hyprland.cachix.org-1:a7pgxzMz7+chwVL3/pzj6jIBMioiJM7ypFP8PwtkuGc= cosmic.cachix.org-1:Dya9IyXD4xdBehWjrkPv6rtxpmMdRel02smYzA85dPE= walker.cachix.org-1:fG8q+uAaMqhsMxWjwvk0IMb4mFPFLqHjuvfwQxE4oJM= claude-code.cachix.org-1:YeXf2aNu7UTX8Vwrze0za1WEDS+4DuI2kVeWEE4fsRk= vicinae.cachix.org-1:1kDrfienkGHPYbkpNj1mWTr7Fm1+zcenzgTizIcI3oc= catppuccin.cachix.org-1:noG/4HkbhJb+lUAdKrph6LaozJvAeEEZj4N732n/9sI=
+            experimental-features = nix-command flakes
+            access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
+            download-attempts = 15
+            http-connections = 25
+            connect-timeout = 30
+
+      # The run_id/run_attempt suffix makes every attempt save a fresh cache:
+      # a key that is only the flake.lock hash can never be updated once it
+      # exists, so a first failed attempt would freeze its partial store
+      # forever. Restoration walks the prefixes newest-first instead.
+      - name: Restore Nix Store Cache
+        id: cache_restore
+        continue-on-error: true
+        uses: nix-community/cache-nix-action/restore@v7
+        with:
+          # matrix.host is part of the key: if a second host is ever added,
+          # both matrix legs of the SAME run would otherwise compute an
+          # identical primary-key (run_id and run_attempt are shared across a
+          # matrix), so the second save would collide with the first.
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.lock') }}-${{ matrix.host }}-${{ github.run_id }}-${{ github.run_attempt }}
+          # Same-lock AND same-host only - see the flake-check job for the
+          # same-lock rationale.
+          restore-prefixes-first-match: |
+            nix-${{ runner.os }}-${{ hashFiles('flake.lock') }}-${{ matrix.host }}
+
+      - name: Verify Restored Store
+        # Best-effort, and now declared as such. The `|| true` below already
+        # made this practically unfailable, but the guarantee lived in the
+        # command rather than the step: drop that `|| true` in a future edit
+        # and a store-verify hiccup would silently skip the Cachix push AND
+        # the store-cache save, because neither carries a status function that
+        # survives a hard failure here.
+        continue-on-error: true
+        run: |
+          # A restored cache can carry db registrations whose files never
+          # made it into the archive (snapshot of a killed build - bit us on
+          # 2026-07-07 as "user-environment.drv does not exist" in cachix's
+          # nix-env install). This job's timeout-killed builds still save
+          # caches on purpose (retry-resume), so heal at restore time.
+          # --repair is load-bearing: plain `--verify` leaves a missing path
+          # registered whenever something valid still refers to it, so Nix
+          # keeps trusting the db and never re-substitutes. See the longer
+          # note in the flake-check job.
+          # Best-effort: verify being unavailable must not fail the job.
+          sudo -i nix-store --verify --repair || sudo /nix/var/nix/profiles/default/bin/nix-store --verify --repair || true
+
+      # Non-critical: only used to speed up this job and to push the build
+      # output below. A failed install must not fail the whole job - the
+      # push step is separately gated on this step's outcome.
+      - name: Set up Cachix
+        id: cachix_setup
+        continue-on-error: true
+        env:
+          CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
+        run: |
+          nix profile install --accept-flake-config nixpkgs#cachix
+          # NOT fatal, and deliberately so. `cachix use` configures this cache as
+          # a SUBSTITUTER - it affects downloading and has nothing to do with
+          # pushing. Every push step in this workflow is gated on this step's
+          # outcome, so letting `cachix use` fail the step meant a transient
+          # substituter-config hiccup silently disabled ALL pushing even with a
+          # perfectly valid token. The gate now reflects what it claims to:
+          # whether the cachix CLI is installed and usable.
+          cachix use ${{ env.CACHIX_NAME }} \
+            || echo "::warning::cachix use failed - this cache is not configured as a substituter for this job. Pushing is unaffected."
+
+      # Wrapped in `cachix watch-exec`, which registers a Nix post-build hook
+      # and uploads each store path the moment it is built, in parallel with
+      # the rest of the build. That is what keeps a run that never reaches the
+      # push step from losing everything: hitting this step's timeout, the
+      # 180-minute job cap, or a cancellation no longer discards hours of work,
+      # because each path was already in the cache when it finished. It also
+      # lets successive runs make incremental progress through a long chain.
+      #
+      # Nix does not fire the hook for substituted paths, so only what was
+      # genuinely built here is uploaded. The push step below stays as a
+      # backstop for anything the hook missed.
+      #
+      # --keep-going: when a derivation fails (broken dep, unfree, or a package
+      # unsupported on this platform) keep building every other branch of the
+      # graph, so one bad package doesn't cost us the whole closure.
+      # One host per job - see the matrix on the job above for why both in a
+      # single `nix build` killed the runner and cost us the push entirely.
+      - name: Build ${{ matrix.host }}
+        id: build
+        # Leaves a ~30-minute tail inside the 180-minute job cap for the push,
+        # the cache save and the notifier.
+        timeout-minutes: 150
+        env:
+          CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
+        run: |
+          # Redirect inside the inner shell so outpaths.txt gets Nix's stdout
+          # only, never watch-exec's own progress output.
+          # Probe first: `cachix watch-exec` failing would be indistinguishable
+          # from the build failing, and a cachix problem must never be reported
+          # as a broken config. If the subcommand isn't usable, build plainly -
+          # the end-of-job push still populates the cache either way.
+          WATCH=0
+          if [ "${{ steps.cachix_setup.outcome }}" = "success" ] && [ -n "$CACHIX_AUTH_TOKEN" ] \
+             && cachix watch-exec --help > /dev/null 2>&1; then
+            WATCH=1
+          fi
+          # Exactly one toplevel, so outpaths.txt holds at most one line.
+          # Kept on a single physical line on purpose: BUILD is handed to
+          # `bash -c`, which reads a bare newline as the end of one command and
+          # the start of another - an earlier version of this variable spanned
+          # several lines and would have run `nix build` with no arguments at
+          # all. If this ever needs wrapping again, use backslash continuations.
+          BUILD='nix build .#nixosConfigurations.${{ matrix.host }}.config.system.build.toplevel --no-link --print-out-paths --keep-going --max-jobs 2 --cores 4 > outpaths.txt'
+          if [ "$WATCH" = 1 ]; then
+            echo "Building under 'cachix watch-exec' - paths are pushed as they are built."
+            # pipefail BEFORE this pipe is mandatory, not stylistic: under the
+            # default `bash -e` shell a failing build piped into tee exits 0, so
+            # a broken config would be reported as a green build. Verified
+            # locally: `bash -e -c 'false | tee /dev/null'` exits 0.
+            set -o pipefail
+            cachix watch-exec ${{ env.CACHIX_NAME }} -- bash -c "$BUILD" 2>&1 | tee watch.log
+          else
+            echo "Cachix unavailable - building without continuous push."
+            bash -c "$BUILD"
+          fi
+
+      # Makes the continuous-push property observable on every run instead of
+      # something that has to be re-derived by hand from raw logs. watch.log is
+      # watch-exec's own output: its Nix post-build hook prints one
+      # "Pushing /nix/store/..." line per path it uploads WHILE the build runs.
+      #
+      # The alarm below is the point of the step. Nix does not fire the hook for
+      # substituted paths, so streamed=0 on a warm run is normal and means
+      # nothing. streamed=0 while the build genuinely built derivations is the
+      # signal that continuous push is broken - and that is precisely the case
+      # that is invisible without this check, because the end-of-job backstop
+      # push then quietly covers for it.
+      - name: Report Continuous Push (watch-exec)
+        id: watch_report
+        if: always()
+        continue-on-error: true
+        run: |
+          if [ ! -f watch.log ]; then
+            echo "No watch.log - this build did not run under continuous push (watch-exec)."
+            echo "streamed=n/a" >> "$GITHUB_OUTPUT"
+            echo "built=n/a" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Anchored on the store path for the same reason the push steps are:
+          # cachix also prints a "Pushing N paths (...)" summary header.
+          STREAMED=$(grep -c '^Pushing /nix/store/' watch.log || true)
+          BUILT=$(grep -c "^building '/nix/store/" watch.log || true)
+          echo "watch-exec streamed $STREAMED path(s) to Cachix during the build"
+          echo "($BUILT derivation(s) were actually built; substituted paths never fire the hook)"
+          echo "streamed=$STREAMED" >> "$GITHUB_OUTPUT"
+          echo "built=$BUILT" >> "$GITHUB_OUTPUT"
+          if [ "$BUILT" -gt 0 ] && [ "$STREAMED" -eq 0 ]; then
+            echo "::warning::watch-exec streamed 0 paths despite building $BUILT derivation(s) - continuous push is not working, so a killed or cancelled run will lose everything it built."
+          fi
+
+      # Pushing to the binary cache is a non-critical secondary goal: it must
+      # never fail the job on its own (e.g. the 2026-07-08 "Error: not found:
+      # cachix" incident).
+      #
+      # always(), not a success/failure gate: salvaging a broken run is the
+      # whole point. Whatever DID build is still valid in the local store and
+      # still worth caching - dropping it makes the next run rebuild it from
+      # scratch.
+      #
+      # Cancellation is included deliberately. cancel-in-progress fires often
+      # here (5 of 12 recent build.yml runs), and run 1095
+      # shows always() steps really do execute in the grace window before the
+      # runner shuts down - it got roughly eleven minutes. That is the one
+      # difference from Save Nix Store Cache below, which stays off cancelled
+      # runs on purpose: a store snapshot taken mid-build is internally
+      # inconsistent, whereas Cachix uploads whole valid paths one at a time,
+      # so a push cut short just means fewer paths, never a corrupt cache.
+      - name: Push to Cachix (${{ matrix.host }})
+        id: cachix_push
+        if: always() && steps.cachix_setup.outcome == 'success'
+        continue-on-error: true
+        env:
+          CACHIX_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
+        run: |
+          # pipefail: the `| tee` below would otherwise mask cachix's exit code,
+          # reintroducing exactly the silent-success failure this step exists
+          # to avoid.
+          set -o pipefail
+
+          if [ -z "$CACHIX_TOKEN" ]; then
+            echo "Skipping Cachix push: no auth token found (likely a fork)."
+            echo "pushed=skipped" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Gate on the build's OUTCOME, not merely on outpaths.txt being
+          # non-empty. --keep-going means the build can fail while still having
+          # realised plenty; --print-out-paths would then print nothing (the
+          # toplevel depends on everything) and an emptiness-only test would
+          # take neither branch usefully. Requiring a clean build before the
+          # targeted fast path means ANY failure falls through to the
+          # whole-store push, which is what actually salvages partial work.
+          if [ "${{ steps.build.outcome }}" = "success" ] && [ -s outpaths.txt ]; then
+          # shellcheck disable=SC2046  # word splitting is REQUIRED here:
+            # one store path per line must become one argument per path.
+            # Quoting would pass the whole file as a single argument.
+            cachix push ${{ env.CACHIX_NAME }} $(cat outpaths.txt) 2>&1 | tee push.log
+            # Anchored on the store path on purpose: `cachix push` prints a summary
+            # header ("Pushing 14 paths (2089 are already present) ... ") as well as one
+            # `Pushing /nix/store/...` line per path, so a bare '^Pushing ' counted N+1.
+            # Run 1136's flake-check reported pushed=15 when exactly 14 paths went up.
+            echo "pushed=$(grep -c '^Pushing /nix/store/' push.log || true)" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # outpaths.txt is empty. --print-out-paths only prints paths Nix
+          # actually realised, and the toplevel system depends on everything,
+          # so ANY failed derivation leaves the toplevel unrealised and the
+          # file empty - even when --keep-going built thousands of paths
+          # first. Same when evaluation died before the build ran at all.
+          # Skipping the push here is exactly what used to throw away every
+          # partial result and make the next run start cold.
+          #
+          # Pushing the store wholesale is safe: Cachix's upstream-cache
+          # filter (on by default) drops every path already present in
+          # cache.nixos.org, so this uploads only what this repo actually
+          # produced, not a copy of nixpkgs.
+          echo "Build did not fully succeed - pushing every valid store path instead."
+          # -self-test-: the Determinate installer writes a self-test path per
+          # run whose name carries a timestamp (self-test-bash-1787097653189,
+          # self-test-zsh-...), so it is a brand-new store path every single
+          # run. Observed being pushed on both platforms; left in, it grows the
+          # cache without bound for no benefit, since nothing ever substitutes
+          # it. Everything else the installer produces is version-stable and
+          # deduplicates, so a narrow exclusion is enough.
+          # Not a bare pipeline: GitHub runs these with `bash -e`, not
+          # `-o pipefail`, so a failing `nix path-info` would be masked - cachix
+          # would read empty stdin, report nothing to push and exit 0, and the
+          # run would look fine while caching nothing. Materialise the list
+          # first so that failure is visible.
+          if ! nix path-info --all > allpaths.txt; then
+            echo "::warning::nix path-info failed - nothing could be pushed this run."
+            echo "pushed=error" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          grep -v -e '\.drv$' -e '-self-test-' allpaths.txt > topush.txt || true
+          if [ ! -s topush.txt ]; then
+            echo "Nothing left to push after filtering."
+            echo "pushed=0" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          cachix push ${{ env.CACHIX_NAME }} < topush.txt 2>&1 | tee push.log
+          # Anchored on the store path on purpose: `cachix push` prints a summary
+          # header ("Pushing 14 paths (2089 are already present) ... ") as well as one
+          # `Pushing /nix/store/...` line per path, so a bare '^Pushing ' counted N+1.
+          # Run 1136's flake-check reported pushed=15 when exactly 14 paths went up.
+          echo "pushed=$(grep -c '^Pushing /nix/store/' push.log || true)" >> "$GITHUB_OUTPUT"
+
+      # Ordered directly after the Cachix push and before the diagnostic
+      # steps: these two are the only things in the job that persist
+      # anything, so nothing that merely prints information may run
+      # ahead of them and eat a timeout or cancellation grace window.
+      # Runs even when the build step failed or timed out, so partially built
+      # derivations survive into the next attempt instead of rebuilding from
+      # scratch every retry. NOT always(): a cancelled run (concurrency,
+      # manual) snapshots a store whose db references paths the tar never
+      # captures - restoring such a cache broke cachix's nix-env install
+      # ("user-environment.drv does not exist", 2026-07-07). Skipping when
+      # the build step never ran also stops early-failure runs from saving
+      # a near-empty store that would shadow the good caches on restore
+      # (restore picks the newest prefix match).
+      - name: Save Nix Store Cache
+        id: cache_save
+        if: (success() || failure()) && steps.build.outcome != 'skipped'
+        continue-on-error: true
+        uses: nix-community/cache-nix-action/save@v7
+        with:
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.lock') }}-${{ matrix.host }}-${{ github.run_id }}-${{ github.run_attempt }}
+          gc-max-store-size-linux: 7000000000
+          # Deliberately NO purge-* options. Purging needs an `actions: write`
+          # permission this job doesn't grant, so they were always a silent
+          # no-op - and actually granting it with purge-created: 0 would have
+          # deleted every good cache on each save, leaving only this run's
+          # (possibly broken) one. GitHub's 10 GB per-repo LRU eviction
+          # handles cleanup on its own.
+
+      # No `du -sh /nix/store` here: it walks the whole store and took over
+      # ten minutes on a 32G store in run 1095, where it burned the entire
+      # cancellation grace window and was SIGTERM'd (exit 143) before the
+      # steps that actually persist anything could run. df reports the same
+      # actionable number instantly.
+      - name: Check Disk Usage
+        if: always()
+        continue-on-error: true
+        run: |
+          echo "--- Disk Space Usage ---"
+          df -h /nix
+          echo "--- Swap ---"
+          free -h
+
+      # `Save Nix Store Cache` above runs `nix store gc` down to
+      # gc-max-store-size BEFORE this step - deliberately, see its comment - and
+      # the built toplevel is not a GC root, so by the time this runs the
+      # closure it would print has usually just been collected. Run 1143 hit
+      # exactly that on BOTH legs:
+      #
+      #   error: path '/nix/store/...-nixos-system-nixos-laptop-...' is not valid
+      #   ##[error]Process completed with exit code 1.
+      #
+      # `continue-on-error: true` turned that into a step reported as `success`,
+      # so it went unnoticed - the silent-failure class §8 exists to prevent.
+      # The ordering is not the bug and must not be "fixed" by moving this step
+      # ahead of the save: run 1095 is why nothing that merely prints may run
+      # before the steps that persist. So ask only about paths still valid, and
+      # say plainly when there are none.
+      - name: Show Package Tree (${{ matrix.host }})
+        if: always()
+        continue-on-error: true
+        run: |
+          if [ ! -s outpaths.txt ]; then
+            echo "No output paths were built."
+            exit 0
+          fi
+          VALID=""
+          while read -r p; do
+            [ -n "$p" ] || continue
+            if nix path-info "$p" >/dev/null 2>&1; then
+              VALID="$VALID $p"
+            fi
+          done < outpaths.txt
+          if [ -z "$VALID" ]; then
+            echo "The built closure is no longer in the store - the store-cache save"
+            echo "garbage-collected it down to gc-max-store-size. Nothing to show."
+            exit 0
+          fi
+          # shellcheck disable=SC2086  # word splitting is REQUIRED here:
+          # one store path per word must become one argument per path.
+          nix path-info -sh -r $VALID
+
+      # ONE consolidated notice per job, replacing the previous separate ones.
+      # The old split was structurally unsound: hard failures fired on
+      # failure() while infra problems fired on success(), so a FAILED job
+      # suppressed the infra report entirely - you would never learn that
+      # Cachix had broken too. It also let a condition name a step the message
+      # body never mentioned, which is how a notice could fire listing nothing.
+      # Collecting every finding in the same step that decides whether to send
+      # removes both classes of bug.
+      #
+      # Silent on a clean run: no findings, no message.
+      #
+      # Shell note: findings are appended inside `if` blocks, never as
+      # `[ test ] && append`. Under `bash -e` a false test makes that an `&&`
+      # list returning non-zero, which aborts the step - the notifier would
+      # stop at the first finding that did not apply.
+      - name: Notify (${{ matrix.host }})
+        if: always() && env.WEBHOOK_ID != ''
+        continue-on-error: true
+        env:
+          WEBHOOK_URL: https://discord.com/api/webhooks/${{ secrets.DISCORD_WEBHOOK_ID }}/${{ secrets.DISCORD_WEBHOOK_TOKEN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          CRIT=""; WARN=""; INFO=""; NOTE=""
+          crit() { CRIT="${CRIT}🔴 $1"$'\n'; }
+          warn() { WARN="${WARN}🟠 $1"$'\n'; }
+          info() { INFO="${INFO}🔵 $1"$'\n'; }
+          # note() rides along in a message that is being sent anyway, but never
+          # causes one on its own. Routine facts - "0 new paths, everything was
+          # already cached" - are true on every warm run, so promoting them to a
+          # trigger would mean a Discord message after every single green build,
+          # and a channel nobody reads is the same as no notifications at all.
+          note() { NOTE="${NOTE}⚪ $1"$'\n'; }
+          if [ "${{ steps.build.outcome }}" = "failure" ]; then
+            crit "Build failed or timed out - whatever DID build was still pushed to Cachix"
+          fi
+          if [ "${{ steps.cachix_setup.outcome }}" = "failure" ]; then
+            warn "Cachix CLI setup failed - nothing could be pushed this run"
+          fi
+          if [ "${{ steps.cachix_push.outcome }}" = "failure" ]; then
+            warn "Cachix push failed - build output was not cached"
+          fi
+          if [ "${{ steps.cache_restore.outcome }}" = "failure" ]; then
+            warn "Nix store cache restore failed - this run built cold"
+          fi
+          if [ "${{ steps.cache_save.outcome }}" = "failure" ]; then
+            warn "Nix store cache save failed - the next run starts cold"
+          fi
+          P="${{ steps.cachix_push.outputs.pushed }}"
+          if [ "$P" = "error" ]; then
+            warn "\`nix path-info\` failed - the store could not be listed, so nothing was pushed"
+          elif [ "$P" = "0" ]; then
+            note "Cachix push uploaded 0 new paths"
+          elif [ -n "$P" ] && [ "$P" != "skipped" ]; then
+            note "Pushed $P new store path(s) to Cachix"
+          fi
+          # 0 pushed after a FAILED build is different from 0 after a clean one:
+          # --keep-going plus the whole-store fallback should have salvaged
+          # something, so nothing uploaded means the salvage path itself did not
+          # work. Worth waking someone for.
+          if [ "$P" = "0" ] && [ "${{ steps.build.outcome }}" = "failure" ]; then
+            warn "Build failed AND the fallback push uploaded nothing - partial results were NOT salvaged"
+          fi
+
+          # Send decision uses CRIT/WARN/INFO only; NOTE rides along.
+          BODY="${CRIT}${WARN}${INFO}${NOTE}"
+          if [ -z "${CRIT}${WARN}${INFO}" ]; then
+            echo "Nothing to report - no notification sent."
+            exit 0
+          fi
+          if [ -n "$CRIT" ]; then
+            HEAD="🚨 **build ${{ matrix.host }} - failed**"
+          elif [ -n "$WARN" ]; then
+            HEAD="⚠️ **build ${{ matrix.host }} - finished, but with problems**"
+          else
+            HEAD="ℹ️ **build ${{ matrix.host }}**"
+          fi
+          jq -n --arg h "$HEAD" --arg b "$BODY" --arg u "$RUN_URL" \
+            '{content: ($h + "\n" + $b + "\n" + $u)}' > payload.json
+          # --fail so a rotated/revoked webhook is not reported as delivered, and
+          # `|| echo` so the notice never fails the step (and is never the last
+          # command left returning non-zero under bash -e).
+          curl -sS --fail -H "Content-Type: application/json" -d @payload.json "$WEBHOOK_URL" \
+            || echo "::warning::Discord webhook delivery failed - the notification above was NOT sent."
+
+      # Deliberately the LAST step, and it exists only so the numbers can be read.
+      #
+      # `Report Continuous Push` prints streamed/built once, in the middle of the
+      # job. The GitHub logs API is hard-capped at ~5000 TAIL lines with no
+      # head/offset parameter, and the signed blob URL that would return the full
+      # log is blocked by egress policy here. An earlier run's leg was 49,186
+      # lines, so that API returned the last 10% - the report was discarded and
+      # the instrument could not be read at all. Re-echoing the values as the
+      # final step guarantees they land inside the retrievable tail.
+      #
+      # Nothing else consumes steps.watch_report.outputs.*, which is exactly why
+      # they vanished. This step is that consumer.
+      - name: Continuous Push Summary (log tail)
+        if: always()
+        continue-on-error: true
+        run: |
+          echo "=== continuous-push summary: ${{ matrix.host }} ==="
+          echo "streamed=${{ steps.watch_report.outputs.streamed }}"
+          echo "built=${{ steps.watch_report.outputs.built }}"
+          echo "pushed=${{ steps.cachix_push.outputs.pushed }}"
+          echo "build_outcome=${{ steps.build.outcome }}"
+
+          # The same tail cap also swallows the ERROR. Run 1142's nixos-laptop
+          # leg failed inside `Build nixos-laptop` at 01:03:30; the `Save Nix
+          # Store Cache` step that ran afterwards emitted 4000+ GC
+          # "deleting '/nix/store/...'" lines in 54 seconds, which pushed the nix
+          # error message out of the retrievable tail entirely - the last 4000
+          # lines the API would return covered only the final 54 seconds of the
+          # job. The failure was diagnosable ONLY by comparing it against run
+          # 1141, which built the byte-identical tree green. watch.log holds the
+          # build's own stdout+stderr, so re-printing its tail here puts the
+          # error back inside the window the API will return.
+          if [ "${{ steps.build.outcome }}" != "success" ] && [ -f watch.log ]; then
+            echo "=== tail of the failed build (re-printed so it survives the log tail cap) ==="
+            tail -n 100 watch.log
+          fi
+
+  # A JOB-LEVEL watchdog, deliberately on its own runner.
+  #
+  # Run 1111 is why this exists. Its build runner died outright: the job ended
+  # with "Build x86_64 Configurations" still marked in_progress, "Push to
+  # Cachix" still marked pending, and the logs returning HTTP 404 because they
+  # were never uploaded. Every other notifier in this workflow lives INSIDE the
+  # job it reports on, so when the runner dies there is nothing left to run them
+  # - the single worst failure this workflow can suffer was also the only one
+  # that told nobody at all.
+  #
+  # needs.<job>.result is filled in by GitHub regardless of how the job ended,
+  # and this job runs on a different machine, so it survives what the in-job
+  # notifiers cannot. On a matrix, .result aggregates: 'failure' if any leg
+  # failed.
+  #
+  # if: always() - without a status function this would be skipped for exactly
+  # the failures it exists to report.
+  report:
+    needs: [flake-check, prewarm-cache, build-x86_64]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      WEBHOOK_ID: ${{ secrets.DISCORD_WEBHOOK_ID }}
+    steps:
+      - name: Notify on job-level failure
+        if: always() && env.WEBHOOK_ID != ''
+        continue-on-error: true
+        env:
+          WEBHOOK_URL: https://discord.com/api/webhooks/${{ secrets.DISCORD_WEBHOOK_ID }}/${{ secrets.DISCORD_WEBHOOK_TOKEN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          FLAKE_CHECK: ${{ needs.flake-check.result }}
+          PREWARM: ${{ needs.prewarm-cache.result }}
+          BUILD: ${{ needs.build-x86_64.result }}
+        run: |
+          BAD=""
+          bad() { BAD="${BAD}🔴 $1"$'\n'; }
+
+          # prewarm-cache is job-level continue-on-error, so its result is
+          # 'success' even when legs fail - its own per-leg notifier covers it
+          # and is not second-guessed here.
+          if [ "$BUILD" = "failure" ] || [ "$BUILD" = "cancelled" ]; then
+            bad "build-x86_64 ended: \`$BUILD\`"
+          fi
+          if [ "$FLAKE_CHECK" = "failure" ] || [ "$FLAKE_CHECK" = "cancelled" ]; then
+            bad "flake-check ended: \`$FLAKE_CHECK\`"
+          fi
+
+          # Silent whenever every job reached a normal end, so this never
+          # duplicates a green run.
+          if [ -z "$BAD" ]; then
+            echo "All jobs reached a normal end - no job-level notification sent."
+            exit 0
+          fi
+
+          jq -n \
+            --arg h "🚨 **build run ended badly (job-level backstop)**" \
+            --arg b "$BAD" \
+            --arg n "If no per-job notice arrived alongside this one, the runner itself died - in that case the push step never ran and NOTHING from that job reached Cachix." \
+            --arg u "$RUN_URL" \
+            '{content: ($h + "\n" + $b + "\n" + $n + "\n" + $u)}' > payload.json
+          # --fail so a rotated/revoked webhook is not reported as delivered, and
+          # `|| echo` so the notice never fails the step (and is never the last
+          # command left returning non-zero under bash -e).
+          curl -sS --fail -H "Content-Type: application/json" -d @payload.json "$WEBHOOK_URL" \
+            || echo "::warning::Discord webhook delivery failed - the notification above was NOT sent."

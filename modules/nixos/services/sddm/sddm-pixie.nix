@@ -1,0 +1,134 @@
+{ delib
+, pkgs
+, lib
+, config
+, ...
+}:
+delib.module {
+  name = "services.sddm-pixie";
+
+  options =
+    with delib;
+    moduleOptions {
+      enable = boolOption false;
+      themeConfig = lib.mkOption {
+        type = lib.types.attrsOf lib.types.str;
+        default = { };
+        example = {
+          accentColor = "#A9C78F";
+        };
+        description = "Attribute set of theme.conf options to override";
+      };
+      background = lib.mkOption {
+        type = lib.types.nullOr lib.types.path;
+        default = null;
+        description = "Path to custom background image";
+      };
+      avatar = lib.mkOption {
+        type = lib.types.nullOr lib.types.path;
+        default = null;
+        description = "Path to custom avatar image";
+      };
+    };
+
+  nixos.ifEnabled =
+    { myconfig
+    , cfg
+    , ...
+    }:
+    let
+      accentColor = config.lib.stylix.colors.withHashtag.base0E;
+      getExtension = path:
+        let
+          filename = builtins.baseNameOf (toString path);
+          parts = lib.splitString "." filename;
+        in
+        if builtins.length parts > 1
+        then lib.last parts
+        else "jpg";
+
+      bgExt = if cfg.background != null then getExtension cfg.background else "jpg";
+      bgFilename = "background.${bgExt}";
+
+      effectiveThemeConfig =
+        { background = "assets/background.jpg"; }  # Default fallback (upstream asset)
+        // { accentColor = accentColor; }  # Base16 accent from stylix
+        // cfg.themeConfig  # User overrides (can override accentColor if desired)
+        // (lib.optionalAttrs (cfg.background != null) { background = "assets/${bgFilename}"; });
+
+      themeConfContent = lib.concatStringsSep "\n" (
+        [ "[General]" ] ++
+        (lib.mapAttrsToList (k: v: "${k}=${v}") effectiveThemeConfig)
+      );
+
+      sddm-pixie = pkgs.stdenvNoCC.mkDerivation {
+        pname = "sddm-pixie";
+        version = "unstable-2025-01-01";
+
+        src = pkgs.fetchFromGitHub {
+          owner = "xCaptaiN09";
+          repo = "pixie-sddm";
+          rev = "main";
+          sha256 = "sha256-lmE/49ySuAZDh5xLochWqfSw9qWrIV+fYaK5T2Ckck8=";
+        };
+
+        dontBuild = true;
+
+        installPhase = ''
+          runHook preInstall
+          mkdir -p $out/share/sddm/themes/pixie
+          cp -r * $out/share/sddm/themes/pixie/
+
+          ${lib.optionalString (cfg.themeConfig != { } || cfg.background != null) ''
+            cat > $out/share/sddm/themes/pixie/theme.conf << 'EOF'
+          ${themeConfContent}
+          EOF
+          ''}
+
+          ${lib.optionalString (cfg.background != null) ''
+            cp ${cfg.background} $out/share/sddm/themes/pixie/assets/${bgFilename}
+          ''}
+
+          ${lib.optionalString (cfg.avatar != null) ''
+            cp ${cfg.avatar} $out/share/sddm/themes/pixie/assets/avatar.jpg
+          ''}
+
+          runHook postInstall
+        '';
+      };
+    in
+    {
+      services.xserver.enable = true;
+      services.xserver.excludePackages = [ pkgs.xterm ];
+
+      services.displayManager.sddm = {
+        enable = true;
+        wayland.enable = true;
+        package = lib.mkForce pkgs.kdePackages.sddm;
+        theme = "pixie";
+
+        extraPackages = with pkgs.kdePackages; [
+          qtdeclarative
+          qtsvg
+          qt5compat
+          qtmultimedia # For QtQuick.Effects blur support
+        ];
+      };
+
+      environment.systemPackages = [
+        sddm-pixie
+      ];
+
+      systemd.services.display-manager.environment =
+        lib.optionalAttrs (myconfig.constants.lcTime != "") {
+          LC_TIME = myconfig.constants.lcTime;
+        };
+
+      services.displayManager.autoLogin = {
+        enable = false;
+        user = myconfig.constants.user;
+      };
+
+      services.getty.autologinUser = null;
+    };
+}

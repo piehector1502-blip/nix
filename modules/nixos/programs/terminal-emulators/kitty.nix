@@ -1,0 +1,62 @@
+{ delib
+, lib
+, config
+, pkgs
+, ...
+}:
+delib.module {
+  name = "programs.kitty";
+  options =
+    with delib;
+    moduleOptions {
+      enable = boolOption false;
+      fontSize = lib.mkOption {
+        type = lib.types.nullOr lib.types.number;
+        default = null;
+      };
+    };
+
+  nixos.ifEnabled = { myconfig, ... }: {
+    myconfig.stylix.targets.kitty.enable = !(myconfig.constants.theme.catppuccin or false);
+  };
+
+  home.ifEnabled =
+    { myconfig, ... }:
+    let
+      cfg = myconfig.programs.kitty;
+    in
+    {
+      home.packages = [ pkgs.nerd-fonts.jetbrains-mono ];
+      fonts.fontconfig.enable = true;
+
+      catppuccin.kitty.enable = myconfig.constants.theme.catppuccin or false;
+      catppuccin.kitty.flavor = myconfig.constants.theme.catppuccinFlavor or "mocha";
+
+      programs.kitty = {
+        enable = true;
+        settings = {
+          font_family = "JetBrainsMono Nerd Font";
+          background_opacity = lib.mkForce "1.0";
+          copy_on_select = "yes";
+          window_padding_width = 4;
+          confirm_os_window_close = 0;
+          enable_audio_bell = false;
+          mouse_hide_wait = "3.0";
+          shell_integration = "enabled";
+
+          cursor_shape = myconfig.constants.terminal.cursorStyle or "block";
+          cursor_blink_interval = if (myconfig.constants.terminal.cursorBlink or true) then "0.75 ease-in-out" else "0";
+          cursor = "#${config.lib.stylix.colors.base0D}"; # Accent blue (base0D) — distinct from text (base05) and background (base00)
+          cursor_text_color = "#${config.lib.stylix.colors.base00}"; # Background color under cursor for contrast
+          cursor_beam_thickness = toString (myconfig.constants.terminal.cursorBeamWidth or 3.0);
+
+          cursor_trail = 200; # Min stationary time in ms before trail triggers
+          cursor_trail_decay = "0.15 0.4"; # Slow decay — trail lingers 150-400ms for visible effect
+          cursor_trail_start_threshold = 2; # Min cell-distance to trigger trail (filters micro-moves)
+        }
+        // lib.optionalAttrs (cfg.fontSize != null) {
+          font_size = cfg.fontSize;
+        };
+      };
+    };
+}

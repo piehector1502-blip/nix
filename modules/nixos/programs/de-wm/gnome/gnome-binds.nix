@@ -1,0 +1,147 @@
+{ delib
+, pkgs
+, lib
+, ...
+}:
+delib.module {
+  name = "programs.gnome";
+  home.ifEnabled =
+    { cfg
+    , myconfig
+    , ...
+    }:
+    let
+      screenshotScript = pkgs.writeShellScript "launch-screenshot" ''
+        FILENAME="${myconfig.constants.screenshots}/Screenshot_$(date +%F_%H-%M-%S).png"
+        mkdir -p "${myconfig.constants.screenshots}"
+        ${pkgs.gnome-screenshot}/bin/gnome-screenshot --file="$FILENAME"
+        ${pkgs.libnotify}/bin/notify-send "Screenshot Saved" "Saved to $FILENAME" -i camera-photo
+      '';
+
+      customKeyPath =
+        i: "org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/custom${toString i}";
+
+      customBindings = [
+        {
+          name = "Vicinae: Application Launcher";
+          command = "vicinae toggle";
+          binding = "<Super>a";
+        }
+        {
+          name = "Vicinae: Clipboard";
+          command = "vicinae vicinae://launch/clipboard/history";
+          binding = "<Super>v";
+        }
+        {
+          name = "Vicinae: Emoji Picker";
+          command = "vicinae vicinae://launch/core/search-emojis";
+          binding = "<Super>period";
+        }
+        {
+          name = "Launch Terminal";
+          command = myconfig.constants.terminal.name;
+          binding = "<Super>Return";
+        }
+        {
+          name = "Launch ${myconfig.constants.browser}";
+          command = myconfig.constants.browser;
+          binding = "<Super>b";
+        }
+        {
+          name = "Launch File Manager";
+          command =
+            if
+            # Add more if needed
+              builtins.elem myconfig.constants.fileManager [
+                "yazi"
+                "ranger"
+                "lf"
+                "nnn"
+              ]
+            then
+              "${myconfig.constants.terminal.name} -e ${myconfig.constants.fileManager}"
+            else
+              "${myconfig.constants.fileManager}";
+          binding = "<Super>f";
+        }
+        {
+          name = "Launch editor";
+          command =
+            if
+              builtins.elem myconfig.constants.editor [
+                "neovim"
+                "nvim"
+                "nano"
+                "vim"
+                "helix"
+              ]
+            then
+              "${myconfig.constants.terminal.name} -e ${myconfig.constants.editor}"
+            else
+              "${myconfig.constants.editor}";
+          binding = "<Super>c";
+        }
+        {
+          name = "Take Screenshot (Native)";
+          command = "${screenshotScript}";
+          binding = "Print";
+        }
+
+      ]
+      ++ (cfg.extraBinds or [ ]);
+
+      dconfList = lib.genList
+        (
+          i: "/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/custom${toString i}/"
+        )
+        (builtins.length customBindings);
+
+      dconfSettings =
+        lib.foldl'
+          (
+            acc: item:
+              let
+                index = item.index;
+                binding = item.value;
+              in
+              acc
+              // {
+                "${customKeyPath index}" = {
+                  name = binding.name;
+                  command = binding.command;
+                  binding = binding.binding;
+                };
+              }
+          )
+          { }
+          (
+            lib.imap0
+              (i: v: {
+                index = i;
+                value = v;
+              })
+              customBindings
+          );
+
+    in
+    {
+      dconf.settings = {
+        "org/gnome/settings-daemon/plugins/media-keys" = {
+          custom-keybindings = dconfList;
+          screensaver = [ "<Super>Delete" ];
+          logout = [ "<Super><Shift>Delete" ];
+          screenshot = [ ];
+        };
+
+        "org/gnome/desktop/wm/keybindings" = {
+          close = [ "<Super><Shift>c" ];
+        };
+
+        "org/gnome/shell/keybindings" = {
+          toggle-overview = [ "<Super>w" ];
+          toggle-application-view = [ ];
+        };
+      }
+      // dconfSettings;
+    };
+}

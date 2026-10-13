@@ -1,0 +1,511 @@
+{ delib
+, pkgs
+, lib
+, moduleSystem
+, ...
+}:
+delib.module {
+  name = "programs.yazi";
+  options = delib.singleEnableOption false;
+
+  nixos.ifEnabled = { ... }: {
+    myconfig.stylix.targets.yazi.enable = false;
+  };
+
+  home.ifEnabled =
+    { myconfig
+    , ...
+    }:
+    let
+      isNixOS = moduleSystem == "nixos";
+    in
+    {
+      home.packages = with pkgs; [
+
+        fzf
+        zoxide
+        ripgrep
+        fd
+        ffmpeg
+        mediainfo
+        poppler-utils # pdftoppm/pdftotext for the PDF previewer (bare `poppler` ships only libs, and collides with poppler-utils in buildEnv)
+        jq
+        zip
+        unzip
+        p7zip
+        gnutar
+        ueberzugpp
+        chafa
+        xdg-utils
+        exiftool
+        ouch
+        trash-cli
+        rich-cli
+        glow # Terminal Markdown renderer, used by the faster-piper "*.md" previewer
+        eza # Used by the faster-piper directory-tree previewer
+        hexyl # Terminal hex viewer, used by the faster-piper fallback previewer
+        sqlite # Provides sqlite3, used by the faster-piper SQLite schema previewer
+      ];
+
+      programs.yazi = {
+        enable = true;
+        # faster-piper.yazi requires Yazi >=26.8.15 (uses the th.icon:match /
+        # Url.spec.is_search APIs, missing on older Yazi).
+        package = pkgs.yazi;
+        shellWrapperName = "y";
+        enableZshIntegration = myconfig.constants.shell == "zsh";
+        enableFishIntegration = myconfig.constants.shell == "fish";
+        enableBashIntegration = myconfig.constants.shell == "bash";
+
+        plugins = {
+          # nurl https://github.com/alberti42/faster-piper.yazi v1.1.1
+          faster-piper = pkgs.fetchFromGitHub {
+            owner = "alberti42";
+            repo = "faster-piper.yazi";
+            tag = "v1.1.1"; # NOTE: If a new version is released change it here
+            hash = "sha256-a7/KTIoIU9idxhYmYFsp6/ezmiBK/mEYfEz9zqZZiEU=";
+          };
+
+          # nurl https://github.com/ndtoan96/ouch.yazi v0.7.2
+          ouch = pkgs.fetchFromGitHub {
+            owner = "ndtoan96";
+            repo = "ouch.yazi";
+            tag = "v0.7.2"; # NOTE: If a new version is released change it here
+            hash = "sha256-t1kUo4+YODeTG9d5Yq/vxElcmRHIebC5TRv+uDGG88c=";
+          };
+
+          # nurl https://github.com/uhs-robert/recycle-bin.yazi v1.1.1
+          recycle-bin = pkgs.fetchFromGitHub {
+            owner = "uhs-robert";
+            repo = "recycle-bin.yazi";
+            tag = "v1.1.1"; # NOTE: If a new version is released change it here
+            hash = "sha256-ghmjM4jmXNC4+P2sl70UhI+8Vv5k3PZV7AwV7iBj1I4=";
+          };
+
+          # nix-prefetch-url --unpack "https://github.com/dedukun/relative-motions.yazi/archive/a603d9ea924dfc0610bcf9d3129e7cba605d4501.tar.gz"
+          # NOTE: re-checked 2026-09-16 - a603d9e is still the HEAD of the default branch, no bump needed.
+          relative-motions = lib.mkForce (
+            let
+              src = pkgs.fetchFromGitHub {
+                owner = "dedukun";
+                repo = "relative-motions.yazi";
+                rev = "a603d9ea924dfc0610bcf9d3129e7cba605d4501";
+                sha256 = "1kk8my0apb4ahp60krqalccp63crggh8jkvi0zdhsf26bkyv2bpn";
+              };
+            in
+            pkgs.runCommandLocal "relative-motions.yazi-patched" { } ''
+              cp -r ${src} $out
+              chmod -R u+w $out
+              substituteInPlace $out/main.lua --replace-quiet 'ya.mgr_emit' 'ya.emit'
+            ''
+          );
+
+          # nurl https://github.com/AnirudhG07/rich-preview.yazi 02597c4a129a36e3ab013b1fd052cf0f555d5490
+          rich-preview = pkgs.fetchFromGitHub {
+            owner = "AnirudhG07";
+            repo = "rich-preview.yazi";
+            rev = "02597c4a129a36e3ab013b1fd052cf0f555d5490";
+            hash = "sha256-8QfBzKyNmKFxwtOmhhpnxUZBRmrN3mPWV/n/0MZlsYo=";
+          };
+
+          smart-remove = pkgs.writeTextDir "main.lua" ''
+            local M = {}
+
+            function M:entry()
+              ya.emit("remove", {})
+            end
+
+            return M
+          '';
+        };
+
+        # -----------------------------------------------------------------------
+        # ⚙️ YAZI.TOML CONFIGURATION
+        # -----------------------------------------------------------------------
+        settings = {
+          mgr = {
+            ratio = [
+              1
+              4
+              3
+            ];
+            sort_by = "alphabetical";
+            sort_sensitive = false; # Disable case sensitivity. Keep disabled otherwise the sorting will be weird.
+            sort_reverse = false; # true = Z to A, false = A to Z
+            sort_dir_first = true; # Directories first
+            sort_translit = false; # Disable transliteration (e.g., "ä" to "a")
+            linemode = "custom_metadata"; # Custom linemode defined in init-lua.nix
+            show_hidden = false; # Show hidden files. They can be viewed by pressing "."
+            show_symlink = true; # Show symlink targets if a file is a symlink
+            scrolloff = 22; # The number of files to keep above and below the cursor when moving through the file list.
+            mouse_events = [
+              "click" # Allows single click to select files
+              "scroll" # Allows scrolling through the file list
+              "drag" # Allows dragging to select multiple files. Some terminals may not support this.
+            ];
+            title_format = "Yazi: {cwd}";
+          };
+
+          preview = {
+            wrap = "no"; # Whatever a long text should go in multiple lines
+            tab_size = 2;
+            max_width = 1920; # Maximum width for preview images
+            max_height = 1080; # Maximum height for preview images
+            cache_dir = "$HOME/.cache/yazi";
+            image_delay = 20;
+            image_filter = "lanczos3"; # Image scaling filter
+            image_quality = 90;
+            image_preview_method =
+              if
+                builtins.elem myconfig.constants.terminal.name [
+                  "kitty"
+                  "ghostty"
+                  "konsole"
+                  "wezterm"
+                  "rio"
+                  "iterm2"
+                ]
+              then
+                "kitty"
+              else if
+                builtins.elem myconfig.constants.terminal.name [
+                  "foot"
+                  "blackbox"
+                ]
+              then
+                "sixel"
+              else
+                "ueberzug";
+            ueberzug_scale = 0.66;
+            ueberzug_offset = [
+              0
+              0
+              0
+              0
+            ];
+          };
+
+          opener = {
+            edit = [
+              {
+                run = "$EDITOR %s";
+                desc = "Edit";
+                block = true;
+                for = "unix";
+              }
+              {
+                run = "code %s";
+                desc = "code";
+                orphan = true;
+                for = "windows";
+              }
+              {
+                run = "code -w %s";
+                desc = "code (block)";
+                block = true;
+                for = "windows";
+              }
+            ];
+
+            # Play media files
+            play = [
+              {
+                run = "xdg-open %s";
+                desc = "Play";
+                for = "linux";
+              }
+              {
+                run = "open %s";
+                desc = "Play";
+                for = "macos";
+              }
+              {
+                run = ''start "" %s1'';
+                desc = "Play";
+                orphan = true;
+                for = "windows";
+              }
+            ];
+
+            # Open media files
+            open = [
+              {
+                run = "xdg-open %s";
+                desc = "Open";
+                for = "linux";
+              }
+              {
+                run = "open %s";
+                desc = "Open";
+                for = "macos";
+              }
+              {
+                run = ''start "" %s1'';
+                desc = "Open";
+                orphan = true;
+                for = "windows";
+              }
+            ];
+
+            # Open folder in file manager (separate window)
+            reveal = [
+              {
+                run = "xdg-open %d1";
+                desc = "Reveal";
+                for = "linux";
+              }
+              {
+                run = "open -R %s1";
+                desc = "Reveal";
+                for = "macos";
+              }
+              {
+                run = "explorer /select,%s1";
+                desc = "Reveal";
+                orphan = true;
+                for = "windows";
+              }
+              {
+                run = ''clear; exiftool %s1; echo "Press enter to exit"; read _'';
+                desc = "Show EXIF";
+                block = true;
+                for = "unix";
+              }
+            ];
+
+            # Extract archives
+            extract = [
+              {
+                run = "ouch d -y %s";
+                desc = "Extract here with ouch";
+                for = "unix";
+              }
+            ];
+
+            # Download files if browsing a remove location, so not on the local disk
+            download = [
+              {
+                run = "ya emit download --open %s";
+                desc = "Download and open";
+              }
+              {
+                run = "ya emit download %s";
+                desc = "Download";
+              }
+            ];
+          };
+
+          open = {
+            rules = [
+              {
+                url = "*/"; # Directories
+                use = [
+                  "open"
+                  "reveal"
+                ];
+              }
+              {
+                mime = "text/*"; # Text files
+                use = [
+                  "edit"
+                  "reveal"
+                ];
+              }
+              {
+                mime = "image/*"; # Image files
+                use = [
+                  "open"
+                  "reveal"
+                ];
+              }
+              {
+                mime = "{audio,video}/*"; # Media files
+                use = [
+                  "play"
+                  "reveal"
+                ];
+              }
+              {
+                mime = "application/{zip,rar,7z*,tar,gzip,xz,zstd,bzip*,lzma,compress,archive,cpio,arj,xar,ms-cab*}"; # Archive files
+                use = [
+                  "extract"
+                  "reveal"
+                ];
+              }
+              {
+                mime = "application/{json,ndjson}"; # JSON files
+                use = [
+                  "edit"
+                  "reveal"
+                ];
+              }
+              {
+                mime = "*/javascript"; # JavaScript files
+                use = [
+                  "edit"
+                  "reveal"
+                ];
+              }
+              {
+                mime = "inode/empty"; # Empty files
+                use = [
+                  "edit"
+                  "reveal"
+                ];
+              }
+              {
+                mime = "vfs/{absent,stale}"; # Remote files that are not yet downloaded
+                use = "download";
+              }
+              {
+                url = "*.html"; # HTML files
+                use = [
+                  "edit"
+                  "reveal"
+                ];
+              }
+
+              {
+                url = "*"; # Fallback for all other files
+                use = [
+                  "open"
+                  "reveal"
+                ];
+              }
+            ];
+          };
+
+          # Performance and background tasks
+          tasks = {
+            micro_workers = 30; # The number of threads for small, quick tasks (e.g., reading metadata, simple logic).
+            macro_workers = 24; # The number of threads for heavy, slow tasks (e.g., recursive searching, bulk copying/moving files).
+            bizarre_retry = 5; # How many times Yazi retries a task that failed for an unexpected ("bizarre") reason before giving up
+            image_alloc = 1073741824; # maximum memory (in bytes) Yazi is allowed to use for decoding images.
+
+            image_bound = [
+              20000
+              20000
+            ];
+            suppress_preload = false; # "Preloading" reads the next file in the list before you even select it, making navigation feel instant.
+          };
+
+          plugin = {
+            # Previewers (Mediainfo + Rich-Preview + faster-piper)
+            prepend_previewers = [
+              # -- Rich Preview -- (rendered Markdown was moved to faster-piper+glow below)
+              {
+                url = "*.csv";
+                run = "rich-preview";
+              }
+              {
+                url = "*.rst";
+                run = "rich-preview";
+              }
+              {
+                url = "*.ipynb";
+                run = "rich-preview";
+              }
+              {
+                url = "*.json";
+                run = "rich-preview";
+              }
+              {
+                url = "*.py";
+                run = "rich-preview";
+              }
+              {
+                url = "*.java";
+                run = "rich-preview";
+              }
+              {
+                url = "*.lua";
+                run = "rich-preview";
+              }
+              {
+                url = "*.rs";
+                run = "rich-preview";
+              }
+              {
+                url = "*.html";
+                run = "rich-preview";
+              }
+              {
+                url = "*.css";
+                run = "rich-preview";
+              }
+
+              # -- faster-piper --
+              {
+                # Rendered Markdown via glow, a more polished terminal renderer than rich-preview's.
+                # glow's -s (style) flag accepts "dark"/"light" directly, matching yazi's $t exactly.
+                url = "*.md";
+                run = ''faster-piper -- CLICOLOR_FORCE=1 glow -w=$w -s=$t "$1"'';
+              }
+              {
+                # Directory tree preview
+                url = "*/";
+                run = ''faster-piper -- eza -TL=3 --color=always --icons=always --group-directories-first --no-quotes "$1"'';
+              }
+              {
+                # Tarball listing
+                url = "*.tar*";
+                run = ''faster-piper --format=url -- tar tf "$1"'';
+              }
+              {
+                # SQLite schema preview
+                mime = "application/sqlite3";
+                run = ''faster-piper -- sqlite3 "$1" ".schema --indent"'';
+              }
+            ];
+
+            # Preload the same faster-piper commands so their previews feel instant (Option B
+            # from faster-piper's README: the run command MUST be identical to its previewer).
+            prepend_preloaders = [
+              {
+                url = "*.md";
+                run = ''faster-piper -- CLICOLOR_FORCE=1 glow -w=$w -s=$t "$1"'';
+              }
+              {
+                url = "*/";
+                run = ''faster-piper -- eza -TL=3 --color=always --icons=always --group-directories-first --no-quotes "$1"'';
+              }
+              {
+                url = "*.tar*";
+                run = ''faster-piper --format=url -- tar tf "$1"'';
+              }
+            ];
+
+            # Fallback for anything nothing else handles - must come last (append, not prepend).
+            append_previewers = [
+              {
+                url = "*";
+                run = ''faster-piper -- hexyl --border=none --terminal-width=$w "$1"'';
+              }
+            ];
+          };
+        };
+      };
+
+      # Desktop entry (Linux only)
+      xdg.desktopEntries.yazi = lib.mkIf isNixOS (lib.mkForce {
+        name = "Yazi";
+        genericName = "File Manager";
+        exec = "${
+          pkgs.${myconfig.constants.terminal.name}
+        }/bin/${myconfig.constants.terminal.name} --class yazi -e yazi";
+        icon = "system-file-manager";
+        terminal = false;
+        startupNotify = false;
+
+        settings = {
+          StartupWMClass = "yazi";
+        };
+        categories = [
+          "System"
+          "FileTools"
+          "FileManager"
+        ];
+        mimeType = [ "inode/directory" ];
+      });
+    };
+}

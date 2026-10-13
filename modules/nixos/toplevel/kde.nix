@@ -1,0 +1,35 @@
+{ delib
+, pkgs
+, lib
+, ...
+}:
+delib.module {
+  name = "programs.kde";
+  options = delib.singleEnableOption false;
+
+  nixos.ifEnabled = {
+    services.desktopManager.plasma6.enable = true;
+
+    security.wrappers.kwin_wayland.capabilities = lib.mkForce "";
+
+    environment.plasma6.excludePackages = with pkgs.kdePackages; [
+      oxygen
+      khelpcenter
+      konsole
+      okular
+      elisa
+      discover
+      kwallet
+      kwallet-pam
+      kwalletmanager
+    ];
+
+    environment.etc."xdg/kwalletrc".text = ''
+      [Wallet]
+      First Use=false
+      Enabled=false
+      [org.freedesktop.secrets]
+      apiEnabled=false
+    '';
+  };
+}

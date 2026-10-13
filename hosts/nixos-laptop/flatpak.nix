@@ -1,0 +1,49 @@
+{ delib
+, inputs
+, ...
+}:
+delib.module {
+  name = "services.laptop.flatpak";
+  options = delib.singleEnableOption false;
+
+  nixos.always = {
+    imports = [ inputs.nix-flatpak.nixosModules.nix-flatpak ];
+  };
+
+  nixos.ifEnabled = {
+    services.flatpak = {
+      enable = true;
+
+      # TODO: choose
+      packages = [
+        "com.github.tchx84.Flatseal" # Flatseal, a permissions manager for Flatpak applications
+        "com.github.unrud.VideoDownloader" # Video Downloader, a tool for downloading videos from various platforms
+        "com.rtosta.zapzap" # Whatsapp client for Linux
+
+        "io.github.shonebinu.Brief" # Brief, command lines cheatsheet application
+        "io.github.AshBuk.FingerGo" # Typing trainer
+        "io.github.lluciocc.Vish" # Gui bash script editor
+        "io.github.iionel.Visu" # Algorithm visualizer
+
+        "me.iepure.devtoolbox" # DevToolbox, a collection of tools for developers
+      ];
+      update.onActivation = false;
+      remotes = [
+        {
+          name = "flathub";
+          location = "https://dl.flathub.org/repo/flathub.flatpakrepo";
+        }
+      ];
+      update.auto = {
+        enable = true;
+        onCalendar = "weekly";
+      };
+      overrides = {
+        "com.rtosta.zapzap".Context.filesystems = [ "home" ]; # Download/save WhatsApp files
+        "com.rtosta.zapzap".Environment.TZ = "Europe/Zurich"; # /etc is reserved by Flatpak (can't bind-mount /etc/localtime), so set TZ directly to stop Electron falling back to UTC
+        "com.github.unrud.VideoDownloader".Context.filesystems = [ "xdg-download" ]; # Save downloaded videos
+        "me.iepure.devtoolbox".Context.filesystems = [ "home" ]; # Open/save files for conversion tools
+      };
+    };
+  };
+}
