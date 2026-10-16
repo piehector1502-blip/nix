@@ -27,6 +27,13 @@ delib.host {
 
     hardware.enableRedistributableFirmware = true;
     hardware.graphics.enable = true;
+    virtualisation.virtualbox.host.enable = true;
+    users.extraGroups.vboxusers.members = [ "pierre" ];
+    users.users.pierre.extraGroups = [ "disk" ];
+    swapDevices = [
+      { device = "/swapfile"; size = 4096; }
+    ];
+    boot.kernelParams = [ "usb-storage.quirks=0bda:9210:u" ];
     nix.settings.max-jobs = 2;
 
     # Laptop-specific packages

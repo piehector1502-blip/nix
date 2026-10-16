@@ -85,6 +85,8 @@ delib.module {
     # The actual specialization
     specialisation.school.configuration = {
       system.nixos.tags = [ "school" ];
+      # Home separata: stesso utente, cartella diversa
+      users.users.${myUserName}.home = lib.mkForce "/home/${myUserName}-school";
 
       myconfig.programs.hyprland.execOnce = lib.mkForce (
         if c.hostname == "nixos-laptop" then [
@@ -135,6 +137,25 @@ delib.module {
 
       # Self-contained virtualisation: school doesn't depend on the host's virtualisation.nix
       virtualisation.podman.enable = true;
+      virtualisation.virtualbox.host.enable = lib.mkForce false;
+      swapDevices = lib.mkForce [ ];
+      boot.kernelParams = lib.mkForce [
+        # Come DEFAULT, senza il fix USB (usb-storage.quirks)
+        "panic=10"
+        "pause_on_oops=300"
+        "quiet"
+        "splash"
+        "root=fstab"
+        "loglevel=4"
+        "lsm=landlock,yama,bpf"
+        "crashkernel=128M"
+        "nmi_watchdog=panic"
+        "softlockup_panic=1"
+        "vt.default_red=0x28,0xff,0x50,0xf1,0x80,0xff,0x8b,0xf8,0x62,0xff,0x50,0xf1,0x80,0xff,0x8b,0xff"
+        "vt.default_grn=0x2a,0x55,0xfa,0xfa,0xbf,0x79,0xe9,0xf8,0x72,0x55,0xfa,0xfa,0xbf,0x79,0xe9,0xff"
+        "vt.default_blu=0x36,0x55,0x7b,0x8c,0xff,0xc6,0xfd,0xf2,0xa4,0x55,0x7b,0x8c,0xff,0xc6,0xfd,0xff"
+      ];
+      services.ollama.enable = true;
       environment.systemPackages = with pkgs; [
         distrobox
         networkmanager-openconnect # For Cisco AnyConnect / GlobalProtect
@@ -159,6 +180,31 @@ delib.module {
 
       # Force git to use the school email
       home-manager.users.${myUserName} = { pkgs, lib, ... }: {
+        home.homeDirectory = lib.mkForce "/home/${myUserName}-school";
+        services.syncthing.enable = true;
+
+        # Nascondi voci duplicate dal menu app (i programmi restano installati)
+        home.file.".local/share/applications/brave-browser.desktop".text = "[Desktop Entry]\nType=Application\nName=Brave Web Browser\nExec=brave %U\nNoDisplay=true\n";
+        home.file.".local/share/applications/com.brave.Browser.desktop".text = "[Desktop Entry]\nType=Application\nName=Brave Web Browser\nExec=brave %U\nNoDisplay=true\n";
+        home.file.".local/share/applications/nvim.desktop".text = "[Desktop Entry]\nType=Application\nName=Neovim wrapper\nExec=nvim %F\nTerminal=true\nNoDisplay=true\n";
+        home.file.".local/share/applications/user-nvim.desktop".text = "[Desktop Entry]\nType=Application\nName=Neovim (User)\nExec=nvim %F\nTerminal=true\nNoDisplay=true\n";
+        home.file.".local/share/applications/opencloudcmd.desktop".text = "[Desktop Entry]\nType=Application\nName=OpenCloud Desktop (cmd)\nExec=opencloudcmd\nNoDisplay=true\n";
+
+        # Nascondi Foot Client e Foot Server dal menu app
+        home.file.".local/share/applications/footclient.desktop".text = "[Desktop Entry]\nType=Application\nName=Foot Client\nExec=footclient\nNoDisplay=true\n";
+        home.file.".local/share/applications/foot-server.desktop".text = "[Desktop Entry]\nType=Application\nName=Foot Server\nExec=foot --server\nNoDisplay=true\n";
+
+        # JavaKara (programma del prof, jar in .school-workspace/javakara)
+        home.file.".local/share/applications/javakara.desktop".text = ''
+          [Desktop Entry]
+          Type=Application
+          Name=JavaKara
+          Comment=JavaKara
+          Exec=${pkgs.jdk}/bin/java -jar /home/${myUserName}-school/.school-workspace/javakara/javakara-x-en.jar
+          Icon=application-x-java-archive
+          Terminal=false
+          Categories=Education;
+        '';
         nixpkgs.config.allowUnfree = true;
 
         home.activation.createSchoolDirs = inputs.home-manager.lib.hm.dag.entryAfter [ "writeBoundary" ] ''
@@ -195,6 +241,8 @@ delib.module {
 
         home.packages = with pkgs; [
           # Required Tools
+          alpaca # Chat grafica per Ollama
+          jdk # Java Development Kit
           mars-mips # MIPS simulator (tecnica digitale)
           geogebra6 #Dynamic mathematics software with graphics, algebra and spreadsheets
 

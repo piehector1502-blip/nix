@@ -24,10 +24,12 @@ delib.module {
           drawio # Diagramming application
           gallery-dl # Command-line program to download image-galleries and -collections from several image hosting sites
           google-chrome # Freeware web browser developed by Google
+          microsoft-edge # Web browser from Microsoft
           libreoffice-qt # Open source microsoft office alternative
           localsend # Simple file sharing over local network
           media-downloader # Qt/C++ GUI front end for yt-dlp and others
           obs-studio # Streaming/Recording
+          syncthing # Continuous file synchronization
           teams-for-linux # Unofficial Microsoft Teams client
           vscode # Microsoft visual studio code IDE
           vesktop # Discord client
