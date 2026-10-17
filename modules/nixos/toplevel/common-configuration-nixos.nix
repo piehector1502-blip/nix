@@ -57,6 +57,7 @@ delib.module {
       # ---------------------------------------------------------
       # SYSTEM PACKAGES
       # ---------------------------------------------------------
+      networking.networkmanager.plugins = lib.mkForce [ ];
       environment.systemPackages =
         with pkgs;
         [

@@ -156,6 +156,22 @@ delib.module {
         "vt.default_blu=0x36,0x55,0x7b,0x8c,0xff,0xc6,0xfd,0xf2,0xa4,0x55,0x7b,0x8c,0xff,0xc6,0xfd,0xff"
       ];
       services.ollama.enable = true;
+      services.printing = {
+        enable = true;
+        drivers = [
+          pkgs.foomatic-db-ppds
+          (pkgs.runCommand "cups-smb-backend" { } ''
+            mkdir -p $out/lib/cups/backend
+            ln -s ${pkgs.samba}/bin/smbspool $out/lib/cups/backend/smb
+          '')
+        ];
+      };
+      environment.etc."samba/smb.conf".text = ''
+        [global]
+          client min protocol = SMB2
+      '';
+      programs.system-config-printer.enable = true;
+      networking.networkmanager.plugins = lib.mkForce [ pkgs.networkmanager-openconnect pkgs.networkmanager-openvpn ];
       environment.systemPackages = with pkgs; [
         distrobox
         networkmanager-openconnect # For Cisco AnyConnect / GlobalProtect
