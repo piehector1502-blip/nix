@@ -610,7 +610,7 @@ delib.host {
 
         # TODO: choose between pixie and astronaut (already built theme or custom wallpaper)
         sddm-astronaut = {
-          enable = true;
+          enable = false;
           embeddedTheme = "jake_the_dog";
         };
 

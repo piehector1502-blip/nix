@@ -139,6 +139,8 @@ delib.module {
       virtualisation.podman.enable = true;
       virtualisation.virtualbox.host.enable = lib.mkForce false;
       swapDevices = lib.mkForce [ ];
+      myconfig.services.sddm-astronaut.enable = lib.mkForce true;
+      services.displayManager.gdm.enable = lib.mkForce false;
       boot.kernelParams = lib.mkForce [
         # Come DEFAULT, senza il fix USB (usb-storage.quirks)
         "panic=10"

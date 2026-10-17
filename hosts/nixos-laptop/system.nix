@@ -28,6 +28,7 @@ delib.host {
     hardware.enableRedistributableFirmware = true;
     hardware.graphics.enable = true;
     virtualisation.virtualbox.host.enable = true;
+    services.displayManager.gdm.enable = true;
     users.extraGroups.vboxusers.members = [ "pierre" ];
     users.users.pierre.extraGroups = [ "disk" ];
     swapDevices = [
