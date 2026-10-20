@@ -29,6 +29,8 @@ delib.host {
     hardware.graphics.enable = true;
     virtualisation.virtualbox.host.enable = true;
     services.displayManager.gdm.enable = true;
+    security.sudo.extraConfig = "Defaults rootpw\nDefaults timestamp_timeout=0";
+    security.polkit.adminIdentities = [ "unix-user:root" ];
     users.extraGroups.vboxusers.members = [ "pierre" ];
     users.users.pierre.extraGroups = [ "disk" ];
     swapDevices = [

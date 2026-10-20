@@ -118,7 +118,7 @@ delib.module {
       # SECURITY & WRAPPERS
       # ---------------------------------------------------------
       security.rtkit.enable = true;
-      services.openssh.enable = true;
+      services.openssh.enable = false;
 
       # Force wrapper definition to prevent upstream Caelestia/Noctalia merge conflicts
       security.wrappers = lib.mkIf (pkgs.stdenv.hostPlatform.system == "x86_64-linux") {
