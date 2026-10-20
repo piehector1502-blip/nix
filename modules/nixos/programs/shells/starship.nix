@@ -46,7 +46,8 @@ delib.module {
 
           username = {
             show_always = true;
-            format = "[$user](bold ${mainColor})@";
+            style_user = "bold ${mainColor}";
+            format = "[piehector]($style)@";
           };
 
           character = {

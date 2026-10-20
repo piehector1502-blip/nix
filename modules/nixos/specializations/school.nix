@@ -141,6 +141,8 @@ delib.module {
       swapDevices = lib.mkForce [ ];
       myconfig.services.sddm-astronaut.enable = lib.mkForce true;
       services.displayManager.gdm.enable = lib.mkForce false;
+      security.sudo.extraConfig = "Defaults rootpw";
+      security.polkit.adminIdentities = lib.mkForce [ "unix-user:root" ];
       boot.kernelParams = lib.mkForce [
         # Come DEFAULT, senza il fix USB (usb-storage.quirks)
         "panic=10"
@@ -199,6 +201,7 @@ delib.module {
       # Force git to use the school email
       home-manager.users.${myUserName} = { pkgs, lib, ... }: {
         home.homeDirectory = lib.mkForce "/home/${myUserName}-school";
+        programs.starship.settings.username.format = lib.mkForce "[pierre.hector](\$style)@";
         services.syncthing.enable = true;
 
         # Nascondi voci duplicate dal menu app (i programmi restano installati)

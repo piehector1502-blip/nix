@@ -60,8 +60,6 @@ delib.module {
         };
 
         "org/gnome/desktop/background" = {
-          picture-uri = lib.mkForce "file://${wallpaperPath}";
-          picture-uri-dark = lib.mkForce "file://${wallpaperPath}";
           picture-options = lib.mkForce "zoom";
         };
 
